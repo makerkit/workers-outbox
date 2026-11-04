@@ -116,9 +116,11 @@ export async function runSchedules(
       tally.created = tally.existing = tally.rejected = 0;
 
       try {
-        await runtime.withConnection(
+        // Commits on this connection, but nudges only once it is released: recording a nudge may
+        // check out another client, which a full pool would make wait on this one.
+        const { pending } = await runtime.withConnection(
           (connection) =>
-            outbox.transaction(connection.db, async (tx, enqueue) => {
+            runtime.collectTransaction(connection.db, async (tx, enqueue) => {
               const counted: ScopedEnqueue<readonly AnyJob[]> = async (job, request) => {
                 const result = await enqueue(job, request);
                 count(tally, result);
@@ -148,6 +150,7 @@ export async function runSchedules(
           deadlineAt,
         );
 
+        // Committed: the outcome is settled before the best-effort nudge, which never throws.
         runtime.emit({
           type: 'schedule_ran',
           name,
@@ -156,6 +159,7 @@ export async function runSchedules(
           ...tally,
           attempts: attempt,
         });
+        await runtime.nudgePending(pending, deadlineAt);
         break;
       } catch (error) {
         const delay = RETRY_DELAYS_MS[attempt - 1];

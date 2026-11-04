@@ -227,6 +227,49 @@ export function createOutbox<const J extends readonly AnyJob[]>(
     return unwrap(result, 'operator action');
   };
 
+  /**
+   * Runs `work` in a transaction and returns what it created, unannounced: the caller nudges once
+   * it no longer holds the connection, since recording a nudge may check out another.
+   */
+  const collectTransaction = async <Tx extends SqlRunner, R>(
+    db: { transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> },
+    work: (tx: Tx, enqueue: ScopedEnqueue<J>) => Promise<R>,
+  ): Promise<{ result: R; pending: PendingNudges }> => {
+    // Grouped by delay: a delayed job is nudged for when it falls due, not now, when its claim
+    // would only miss. Past the queue's 24 h ceiling no nudge is sent; the cron sweep runs it.
+    const pending: PendingNudges = new Map();
+
+    const result = await db.transaction((tx) =>
+      work(tx, async (job, request) => {
+        const enqueued = await outbox.enqueue(tx, job, request);
+
+        if (enqueued.status === 'created') {
+          const delayMs = Number.isFinite(request.delayMs) ? Math.max(0, request.delayMs!) : 0;
+
+          // Rounded up: an early nudge misses, a late one by under a second is harmless.
+          const delaySeconds = Math.ceil(delayMs / 1_000);
+
+          if (delaySeconds <= MAX_QUEUE_DELAY_SECONDS) {
+            const group = pending.get(delaySeconds) ?? [];
+            group.push({ id: enqueued.id, kind: enqueued.kind });
+            pending.set(delaySeconds, group);
+          }
+        }
+
+        return enqueued;
+      }),
+    );
+
+    return { result, pending };
+  };
+
+  /** Never throws: a nudge is best effort, the cron sweep is the backstop. */
+  const nudgePending = async (pending: PendingNudges, deadlineAt?: number) => {
+    for (const [delaySeconds, jobs] of pending) {
+      await runtime.nudge(jobs, delaySeconds, deadlineAt === undefined ? {} : { deadlineAt });
+    }
+  };
+
   const outbox: Outbox<J> = {
     /** Runs iff the caller's transaction commits; a duplicate `dedupeKey` returns the existing job. */
     async enqueue<T extends J[number]>(
@@ -297,34 +340,8 @@ export function createOutbox<const J extends readonly AnyJob[]>(
       db: { transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> },
       work: (tx: Tx, enqueue: ScopedEnqueue<J>) => Promise<R>,
     ): Promise<R> {
-      // Grouped by delay: a delayed job is nudged for when it falls due, not now, when its claim
-      // would only miss. Past the queue's 24 h ceiling no nudge is sent; the cron sweep runs it.
-      const created = new Map<number, { id: string; kind: string }[]>();
-
-      const result = await db.transaction((tx) =>
-        work(tx, async (job, request) => {
-          const enqueued = await outbox.enqueue(tx, job, request);
-
-          if (enqueued.status === 'created') {
-            const delayMs = Number.isFinite(request.delayMs) ? Math.max(0, request.delayMs!) : 0;
-
-            // Rounded up: an early nudge misses, a late one by under a second is harmless.
-            const delaySeconds = Math.ceil(delayMs / 1_000);
-
-            if (delaySeconds <= MAX_QUEUE_DELAY_SECONDS) {
-              const group = created.get(delaySeconds) ?? [];
-              group.push({ id: enqueued.id, kind: enqueued.kind });
-              created.set(delaySeconds, group);
-            }
-          }
-
-          return enqueued;
-        }),
-      );
-
-      for (const [delaySeconds, jobs] of created) {
-        await runtime.nudge(jobs, delaySeconds);
-      }
+      const { result, pending } = await collectTransaction(db, work);
+      await nudgePending(pending);
 
       return result;
     },
@@ -396,7 +413,12 @@ export function createOutbox<const J extends readonly AnyJob[]>(
         }
       }),
 
-    [RUNTIME]: { ...runtime, withConnection },
+    [RUNTIME]: {
+      ...runtime,
+      withConnection,
+      collectTransaction: collectTransaction as OutboxRuntime['collectTransaction'],
+      nudgePending,
+    },
   };
 
   return outbox;
@@ -434,7 +456,9 @@ export interface Outbox<J extends readonly AnyJob[] = readonly AnyJob[]> {
   /**
    * Runs `work` in `db.transaction` and nudges the jobs it created once that commits. A throw
    * rolls back and nudges nothing. Pass the top-level db, not a transaction (drizzle would open a
-   * savepoint, and the nudge would precede the outer commit).
+   * savepoint, and the nudge would precede the outer commit). With `recordNudges`, recording the
+   * nudge checks out a connection from `connect`: if `db` holds a client from that same pool, size
+   * the pool for both, or pass a pool-backed db that releases its client when the commit returns.
    */
   transaction<Tx extends SqlRunner, R>(
     db: { transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> },
@@ -465,12 +489,21 @@ export interface Outbox<J extends readonly AnyJob[] = readonly AnyJob[]> {
   readonly [RUNTIME]: OutboxRuntime;
 }
 
+/** Jobs a transaction created, by nudge delay in seconds, awaiting their post-commit nudge. */
+export type PendingNudges = Map<number, { id: string; kind: string }[]>;
+
 /** Not part of the public API: the runtime plus a bounded connection for one-off work. */
 export type OutboxRuntime = Runtime & {
   withConnection<T>(
     work: (connection: LaneConnection) => Promise<T>,
     invocationDeadlineAt?: number,
   ): Promise<T>;
+  /** `outbox.transaction` without its nudges, for a caller that must release its connection first. */
+  collectTransaction<Tx extends SqlRunner, R>(
+    db: { transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> },
+    work: (tx: Tx, enqueue: ScopedEnqueue<readonly AnyJob[]>) => Promise<R>,
+  ): Promise<{ result: R; pending: PendingNudges }>;
+  nudgePending(pending: PendingNudges, deadlineAt?: number): Promise<void>;
 };
 
 const isQueueSender = (value: unknown): value is QueueSender =>

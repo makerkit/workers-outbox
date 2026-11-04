@@ -193,10 +193,33 @@ export function classifySafely(job: AnyJob, error: unknown): HandlerOutcome {
   }
 }
 
+// Nullish is absent: settlement treats a missing optional field and `null` alike.
+const isOptional = (value: unknown, type: 'string' | 'function') =>
+  value == null || typeof value === type;
+
+/** Checks every field settlement reads, not just the tag: JS or an unsafe cast can return anything. */
 function isHandlerOutcome(value: unknown): value is HandlerOutcome {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    OUTCOME_TYPES.has((value as { type?: unknown }).type as string)
-  );
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const outcome = value as Record<string, unknown>;
+
+  if (!OUTCOME_TYPES.has(outcome['type'] as string)) {
+    return false;
+  }
+
+  switch (outcome['type']) {
+    case 'ok':
+      return isOptional(outcome['commit'], 'function');
+    case 'retry':
+      // A non-numeric `afterMs` is not checked: retry scheduling falls back to backoff.
+      return isCode(outcome['code']) && isOptional(outcome['message'], 'string');
+    case 'fail':
+      return isCode(outcome['code']) && isOptional(outcome['message'], 'string');
+    default:
+      return typeof outcome['reason'] === 'string';
+  }
 }
+
+const isCode = (value: unknown) => typeof value === 'string' && value !== '';

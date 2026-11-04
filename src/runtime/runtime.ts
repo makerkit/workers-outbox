@@ -119,7 +119,10 @@ const MAX_ERROR_SAMPLES = 5;
 
 function tally(report: RunReport, kind: string, key: TallyKey) {
   report[key]++;
-  const forKind = (report.byKind[kind] ??= emptyTally());
+  // Own properties only: a legal kind such as `constructor` must not resolve to `Object`.
+  const forKind = Object.hasOwn(report.byKind, kind)
+    ? report.byKind[kind]!
+    : (report.byKind[kind] = emptyTally());
   forKind[key]++;
 }
 
@@ -990,7 +993,7 @@ export function createRuntime(config: RuntimeConfig) {
     const delay = Number.isFinite(delaySeconds)
       ? Math.min(MAX_QUEUE_DELAY_SECONDS, Math.max(0, Math.ceil(delaySeconds)))
       : 0;
-    const queue = config.queues[lane];
+    const queue = Object.hasOwn(config.queues, lane) ? config.queues[lane] : undefined;
 
     if (!queue) {
       emit({ type: 'nudge_skipped', ids: [...ids], lane, reason: 'no_queue' });
@@ -1451,7 +1454,7 @@ export function createRuntime(config: RuntimeConfig) {
   }
 
   async function continueDrain(lane = 'default', options: { deadlineAt?: number } = {}) {
-    const queue = config.queues[lane];
+    const queue = Object.hasOwn(config.queues, lane) ? config.queues[lane] : undefined;
 
     if (!queue) {
       emit({ type: 'continuation_skipped', lane, reason: 'no_queue' });

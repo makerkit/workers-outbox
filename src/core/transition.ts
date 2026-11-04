@@ -162,7 +162,7 @@ function decideRetry(input: {
     return { to: 'retrying', delayMs: 0, code, message, codeStreak, ...kept, attemptOutcome };
   }
 
-  const rule = policy.codes[code];
+  const rule = ownRule(policy, code);
   const stickyCode = job.stickyCode ?? (rule?.sticky ? code : null);
   const failure = { code, message, codeStreak, ...episode(stickyCode), attemptOutcome };
 
@@ -171,7 +171,7 @@ function decideRetry(input: {
       ? { to: 'cancelled', reason: 'exhausted', ...failure }
       : { to: 'dead', reason: 'exhausted', ...failure };
 
-  const codeCap = policy.perCode[code];
+  const codeCap = Object.hasOwn(policy.perCode, code) ? policy.perCode[code] : undefined;
 
   if (codeCap !== undefined && codeStreak >= codeCap) {
     return exhausted();
@@ -198,10 +198,14 @@ function decideRetry(input: {
   };
 }
 
+// Codes are caller strings: `constructor` must not resolve to an inherited `Object` member.
+const ownRule = (policy: RetryPolicy, code: string) =>
+  Object.hasOwn(policy.codes, code) ? policy.codes[code] : undefined;
+
 function attemptCeiling(policy: RetryPolicy, code: string, stickyCode: string | null) {
-  const own = policy.codes[code]?.maxAttempts ?? policy.maxAttempts;
+  const own = ownRule(policy, code)?.maxAttempts ?? policy.maxAttempts;
   const carried =
-    stickyCode === null ? policy.maxAttempts : (policy.codes[stickyCode]?.maxAttempts ?? 0);
+    stickyCode === null ? policy.maxAttempts : (ownRule(policy, stickyCode)?.maxAttempts ?? 0);
 
   // Codes and episodes only widen `maxAttempts`; `streak` caps are how a code narrows it.
   return Math.max(policy.maxAttempts, own, carried);

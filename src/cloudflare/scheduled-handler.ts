@@ -23,7 +23,8 @@ export interface ScheduledHandlerOptions {
   recoveryLimit?: number;
   /**
    * Recovery's share of the tick, so a crash backlog can't starve fresh work. Default 120 s.
-   * What doesn't fit stays expired for the next tick.
+   * What doesn't fit stays expired for the next tick. Counted from when recovery starts, and held
+   * back from `schedules` (up to half the invocation), so schedules can't consume it.
    */
   recoveryBudgetMs?: number;
   /** Drained before the catch-all so other kinds can't starve these; keep each ≤ 45 s. */
@@ -73,6 +74,15 @@ export function createScheduledHandler<Env, Ctx = unknown>(
       `createScheduledHandler: invocationBudgetMs must be an integer in [1, ${MAX_INVOCATION_BUDGET_MS}], got ${invocationBudgetMs}`,
     );
   }
+  if (!Number.isInteger(recoveryBudgetMs) || recoveryBudgetMs < 1) {
+    throw new Error(
+      `createScheduledHandler: recoveryBudgetMs must be a positive integer, got ${recoveryBudgetMs}`,
+    );
+  }
+
+  // Never more than half the tick: schedules keep a window even under a small invocation budget.
+  const recoveryReserveMs = Math.min(recoveryBudgetMs, Math.floor(invocationBudgetMs / 2));
+
   const retention = {
     succeededRetentionMs: options.retention?.succeededRetentionMs ?? DEFAULT_SUCCEEDED_RETENTION_MS,
     terminalRetentionMs: options.retention?.terminalRetentionMs ?? DEFAULT_TERMINAL_RETENTION_MS,
@@ -105,12 +115,20 @@ export function createScheduledHandler<Env, Ctx = unknown>(
 
     if (schedules.length > 0) {
       // Never throws: each schedule reports its own failure, and the sweep runs regardless.
-      await runSchedules(outbox, schedules, cron, event.scheduledTime ?? startedAt, deadlineAt);
+      // Recovery's slice is held back, so slow schedules can't strand expired leases tick after tick.
+      await runSchedules(
+        outbox,
+        schedules,
+        cron,
+        event.scheduledTime ?? startedAt,
+        deadlineAt - recoveryReserveMs,
+      );
     }
 
+    // Measured from when recovery starts, not the tick: schedule time is not recovery's.
     const recovery = await phase('recover', () =>
       runtime.recover(recoveryLimit, {
-        deadlineAt: Math.min(deadlineAt, startedAt + recoveryBudgetMs),
+        deadlineAt: Math.min(deadlineAt, runtime.nowMs() + recoveryBudgetMs),
       }),
     );
 

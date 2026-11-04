@@ -1201,7 +1201,8 @@ function mapBulk<R extends string>(
   const results: Record<string, R | 'not_found'> = {};
 
   for (const id of new Set(ids)) {
-    const row = byId.get(id);
+    // PostgreSQL accepts any-case hex and returns it lowercase; keys stay as the caller wrote them.
+    const row = byId.get(id.toLowerCase());
     results[id] = row ? decide(row) : 'not_found';
   }
 

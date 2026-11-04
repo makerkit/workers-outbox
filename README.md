@@ -789,7 +789,7 @@ if (drift.length > 0) {
 
 Not using drizzle-kit? Apply `OUTBOX_MIGRATIONS` from `./sql`, one statement at a time, in order.
 
-**Time limits.** Each invocation has one deadline shared by everything it awaits: claims, handlers, settlements, recovery, cleanup, queue sends and connection acquisition. The queue and scheduled handlers take `invocationBudgetMs` (default 840 s, under Cloudflare's 15-minute limit); the scheduled handler's `recoveryBudgetMs` (default 120 s) caps recovery's share, so a crash backlog can't starve fresh work. A job whose claim arrives too late to run safely never starts: its attempt closes as `claim_late`, charging neither an attempt nor a crash, and it retries in 5 s.
+**Time limits.** Each invocation has one deadline shared by everything it awaits: claims, handlers, settlements, recovery, cleanup, queue sends and connection acquisition. The queue and scheduled handlers take `invocationBudgetMs` (default 840 s, under Cloudflare's 15-minute limit); the scheduled handler's `recoveryBudgetMs` (default 120 s) caps recovery's share, so a crash backlog can't starve fresh work, and is held back from `schedules`, so slow schedules can't starve recovery. A job whose claim arrives too late to run safely never starts: its attempt closes as `claim_late`, charging neither an attempt nor a crash, and it retries in 5 s.
 
 ## Performance
 
