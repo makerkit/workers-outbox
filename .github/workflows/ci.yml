@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Typecheck, lint, format, docs, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4 # version from package.json's packageManager
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm format:check
+      - run: pnpm oxlint
+      - run: pnpm typecheck
+      - run: pnpm check:readme
+      - run: pnpm build
+      # The published shape: every entry point must load from dist/.
+      - name: Import every built entry point
+        run: |
+          for entry in index cloudflare drizzle sql pg inspect testing; do
+            node -e "import('./dist/$entry.mjs').then(m => console.log('$entry', Object.keys(m).length, 'exports'))"
+          done
+
+  unit:
+    name: Tests (pglite, Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+
+  postgres:
+    name: Tests (PostgreSQL 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: outbox
+          POSTGRES_DB: outbox_test
+        ports: ['55417:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 1s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:pg
+
+  load:
+    name: Load (PostgreSQL 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: outbox
+          POSTGRES_DB: outbox_test
+        ports: ['55417:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 1s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Correctness under concurrency is asserted; the throughput numbers are only printed.
+      - run: pnpm test:load
+
+  example:
+    name: Example Worker (wrangler dev)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: outbox
+          POSTGRES_DB: outbox_test
+        ports: ['55417:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 1s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # On the runner only; pinned so a wrangler release can't change the result unannounced.
+      - run: npm install --global wrangler@4.157.0
+      - run: pnpm test:example
+        env:
+          WRANGLER: wrangler
+          # Fail, rather than skip, if wrangler or Postgres is missing.
+          OUTBOX_REQUIRE_E2E: '1'

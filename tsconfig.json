@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "noEmit": true,
+    "paths": {
+      "@makerkit/workers-outbox": ["./src/index.ts"],
+      "@makerkit/workers-outbox/*": ["./src/*/index.ts"]
+    }
+  },
+  "include": ["src", "examples", "*.config.ts"]
+}

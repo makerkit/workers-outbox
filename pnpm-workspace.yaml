@@ -1,0 +1,3 @@
+# esbuild (pulled in by drizzle-kit, dev-only) works from its prebuilt optional binary.
+allowBuilds:
+  esbuild: false

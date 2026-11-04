@@ -1,0 +1,16 @@
+# Real Postgres for the multi-session suite (`pnpm test:pg`). pglite is a single
+# session, so SKIP LOCKED contention, concurrent enqueue races and query plans
+# are only provable here. Data is tmpfs: every `db:up` starts empty.
+# PostgreSQL 17 is the minimum supported version (settlement relies on transaction_timeout).
+services:
+  pg17:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: outbox
+      POSTGRES_DB: outbox_test
+    ports: ['55417:5432']
+    tmpfs: [/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 1s
+      retries: 30

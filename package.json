@@ -1,0 +1,91 @@
+{
+  "name": "@makerkit/workers-outbox",
+  "version": "0.0.1",
+  "description": "Transactional outbox for Postgres on Cloudflare Workers (Hyperdrive + Queues + Cron Triggers).",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
+    "./drizzle": {
+      "types": "./dist/drizzle.d.mts",
+      "default": "./dist/drizzle.mjs"
+    },
+    "./pg": {
+      "types": "./dist/pg.d.mts",
+      "default": "./dist/pg.mjs"
+    },
+    "./sql": {
+      "types": "./dist/sql.d.mts",
+      "default": "./dist/sql.mjs"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.mts",
+      "default": "./dist/testing.mjs"
+    },
+    "./cloudflare": {
+      "types": "./dist/cloudflare.d.mts",
+      "default": "./dist/cloudflare.mjs"
+    },
+    "./inspect": {
+      "types": "./dist/inspect.d.mts",
+      "default": "./dist/inspect.mjs"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "oxlint": "oxlint",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down",
+    "test:pg": "OUTBOX_PG_URLS=postgres://postgres:outbox@localhost:55417/outbox_test vitest run",
+    "check:readme": "node scripts/check-readme.mjs",
+    "test:example": "OUTBOX_PG_URLS=postgres://postgres:outbox@localhost:55417/outbox_test vitest run --config examples/worker/vitest.config.ts",
+    "test:load": "OUTBOX_LOAD=1 OUTBOX_PG_URLS=postgres://postgres:outbox@localhost:55417/outbox_test vitest run src/load --testTimeout=600000 --hookTimeout=120000"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@electric-sql/pglite": ">=0.5.0",
+    "drizzle-orm": ">=1.0.0-rc.4",
+    "pg": ">=8.15.0"
+  },
+  "peerDependenciesMeta": {
+    "@electric-sql/pglite": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.13",
+    "@types/node": "^26.6.4",
+    "@types/pg": "^8.23.1",
+    "drizzle-kit": "1.0.0-rc.4",
+    "drizzle-orm": "1.0.0-rc.4",
+    "oxfmt": "^0.72.0",
+    "oxlint": "^1.87.0",
+    "pg": "^8.23.1",
+    "tsdown": "^0.23.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3",
+    "zod": "^4.6.7"
+  },
+  "packageManager": "pnpm@12.16.1",
+  "dependencies": {
+    "@standard-schema/spec": "^1.1.0",
+    "uuid": "^14.0.3"
+  }
+}
