@@ -2,13 +2,14 @@ import { describe, expect, expectTypeOf, it } from 'vitest';
 import { z } from 'zod';
 
 import {
+  defaultClassify,
   defineJob,
   HANDLER_GRACE_MS,
   LEASE_MARGIN_MS,
   MAX_TIMEOUT_MS,
   type JobContext,
 } from './define-job';
-import { ok } from './outcome';
+import { ok, retry } from './outcome';
 
 const payload = z.object({ userId: z.string() });
 
@@ -52,6 +53,31 @@ describe('defineJob', () => {
       code: 'unexpected',
       message: 'socket hang up',
     });
+  });
+
+  it('falls back to defaultClassify when classify returns undefined', () => {
+    const job = defineJob({
+      kind: 'a',
+      payload,
+      timeoutMs: 1_000,
+      classify: (error) =>
+        error instanceof Error && error.message === 'locked'
+          ? retry({ code: 'yielded' })
+          : undefined,
+      handle: async () => ok(),
+    });
+
+    expect(job.classify(new Error('locked'))).toEqual({ type: 'retry', code: 'yielded' });
+    expect(job.classify(new Error('socket hang up'))).toEqual(
+      defaultClassify(new Error('socket hang up')),
+    );
+    expect(job.classify('boom')).toEqual({ type: 'retry', code: 'unexpected', message: 'boom' });
+  });
+
+  it('uses the exported defaultClassify when classify is omitted', () => {
+    const job = defineJob({ kind: 'a', payload, timeoutMs: 1_000, handle: async () => ok() });
+
+    expect(job.classify).toBe(defaultClassify);
   });
 
   // port: submission-job.repository.claim.db:275

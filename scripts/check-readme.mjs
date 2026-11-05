@@ -47,6 +47,8 @@ const PRELUDE = {
   flagUser: 'declare function flagUser(tx: OutboxDb, jobId: string): Promise<void>;',
   markWelcomed: 'declare function markWelcomed(tx: OutboxDb, userId: string): Promise<void>;',
   isoWeek: 'declare function isoWeek(date: Date): string;',
+  deleteExpiredBatch:
+    'declare function deleteExpiredBatch(db: OutboxDb, limit: number): Promise<number>;',
   sendNewsletter:
     'declare function sendNewsletter(week: string, options: { signal: AbortSignal; idempotencyKey: string }): Promise<void>;',
   dbFor: 'declare function dbFor(env: Env): NodePgDatabase;',

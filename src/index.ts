@@ -1,4 +1,5 @@
 export {
+  defaultClassify,
   defineJob,
   defineJobFor,
   type AnyJob,
@@ -13,7 +14,12 @@ export type { DeadReason, Transition } from './core/transition';
 export type { AttemptOutcome, AttemptTrigger, JobStatus } from './core/status';
 export {
   createOutbox,
+  EnqueueRefusedError,
+  type AcceptedEnqueueResult,
   type DepsOf,
+  type RefusedEnqueueResult,
+  type StrictOutbox,
+  type StrictScopedEnqueue,
   type EnqueueRequest,
   type EnqueueResult,
   type ScopedEnqueue,

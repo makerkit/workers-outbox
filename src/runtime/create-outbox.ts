@@ -84,6 +84,13 @@ export interface OutboxBaseOptions<J extends readonly AnyJob[]> {
    */
   generateId?: () => string;
   /**
+   * Opt-in: `enqueue`, `transaction`'s `enqueue` and a `run` schedule's `enqueue` throw
+   * `EnqueueRefusedError` instead of returning `invalid_payload` or `dedupe_conflict`, so a
+   * business write can't commit without its job. With `true`, `createOutbox` returns a
+   * `StrictOutbox`, accepted wherever an `Outbox` is. Default `false`: refusals are returned.
+   */
+  strictEnqueue?: boolean;
+  /**
    * This deploy's version, e.g. `env.CF_VERSION_METADATA`. Jobs are stamped with it, and an
    * older deploy skips newer jobs for `gateMs` (default 6 h) during a gradual rollout.
    */
@@ -126,6 +133,29 @@ export type EnqueueResult =
   | { status: 'dedupe_conflict'; reason: 'kind'; id: string; existingKind: string }
   | { status: 'invalid_payload'; issues: readonly StandardSchemaV1.Issue[] };
 
+export type AcceptedEnqueueResult = Extract<EnqueueResult, { status: 'created' | 'exists' }>;
+
+export type RefusedEnqueueResult = Exclude<EnqueueResult, AcceptedEnqueueResult>;
+
+/** Thrown by a strict outbox's enqueue (`strictEnqueue: true`) instead of returning a refusal. */
+export class EnqueueRefusedError extends Error {
+  readonly kind: string;
+  readonly result: RefusedEnqueueResult;
+
+  constructor(kind: string, result: RefusedEnqueueResult) {
+    // Kind and status only: schema issues can quote payload values, and errors reach event sinks.
+    const detail =
+      result.status === 'dedupe_conflict'
+        ? `: its dedupeKey belongs to kind ${JSON.stringify(result.existingKind)}`
+        : '';
+
+    super(`outbox.enqueue: ${JSON.stringify(kind)} refused (${result.status})${detail}`);
+    this.name = 'EnqueueRefusedError';
+    this.kind = kind;
+    this.result = result;
+  }
+}
+
 /** Not part of the public API. */
 export const RUNTIME = Symbol('workers-outbox.runtime');
 
@@ -135,6 +165,12 @@ export const DEFAULT_MAX_PAYLOAD_BYTES = 256 * 1024;
 
 const MAX_ERASE_BATCH = 10_000;
 
+export function createOutbox<const J extends readonly AnyJob[]>(
+  options: OutboxOptions<J> & { strictEnqueue: true },
+): StrictOutbox<J>;
+export function createOutbox<const J extends readonly AnyJob[]>(
+  options: OutboxOptions<J>,
+): Outbox<J>;
 export function createOutbox<const J extends readonly AnyJob[]>(
   options: OutboxOptions<J>,
 ): Outbox<J> {
@@ -149,6 +185,15 @@ export function createOutbox<const J extends readonly AnyJob[]>(
 
   const version = parseVersion(options.version);
   const generateId = options.generateId ?? uuidv7;
+  const strictEnqueue = options.strictEnqueue ?? false;
+
+  const refused = (kind: string, result: RefusedEnqueueResult): EnqueueResult => {
+    if (strictEnqueue) {
+      throw new EnqueueRefusedError(kind, result);
+    }
+
+    return result;
+  };
 
   const runtime = createRuntime({
     version,
@@ -295,13 +340,16 @@ export function createOutbox<const J extends readonly AnyJob[]>(
       const wire = toWire(request.payload, maxPayloadBytes);
 
       if (!wire.ok) {
-        return { status: 'invalid_payload', issues: [{ message: wire.message }] };
+        return refused(job.kind, {
+          status: 'invalid_payload',
+          issues: [{ message: wire.message }],
+        });
       }
 
       const validated = await job.payload['~standard'].validate(wire.value);
 
       if (validated.issues) {
-        return { status: 'invalid_payload', issues: validated.issues };
+        return refused(job.kind, { status: 'invalid_payload', issues: validated.issues });
       }
 
       const id = generateId();
@@ -327,7 +375,12 @@ export function createOutbox<const J extends readonly AnyJob[]>(
       );
 
       if (row.kind !== job.kind) {
-        return { status: 'dedupe_conflict', reason: 'kind', id: row.id, existingKind: row.kind };
+        return refused(job.kind, {
+          status: 'dedupe_conflict',
+          reason: 'kind',
+          id: row.id,
+          existingKind: row.kind,
+        });
       }
 
       emit({ type: 'enqueued', jobId: row.id, kind: row.kind, created: row.created });
@@ -434,11 +487,13 @@ export interface TenantScope {
   tenantKey?: string | null | undefined;
 }
 
-/** `enqueue` bound to one transaction. */
-export type ScopedEnqueue<J extends readonly AnyJob[]> = <T extends J[number]>(
+/** `enqueue` bound to one transaction. `R` narrows to `AcceptedEnqueueResult` on a strict outbox. */
+export type ScopedEnqueue<J extends readonly AnyJob[], R extends EnqueueResult = EnqueueResult> = <
+  T extends J[number],
+>(
   job: T,
   request: EnqueueRequest<T>,
-) => Promise<EnqueueResult>;
+) => Promise<R>;
 
 type Result<F extends (...args: never[]) => Promise<unknown>> = Awaited<ReturnType<F>>;
 
@@ -446,13 +501,13 @@ type Result<F extends (...args: never[]) => Promise<unknown>> = Awaited<ReturnTy
  * What `createOutbox` returns. Named, so an exported `outboxFor` compiles under `declaration`
  * without reaching the runtime's internal key.
  */
-export interface Outbox<J extends readonly AnyJob[] = readonly AnyJob[]> {
+export interface Outbox<
+  J extends readonly AnyJob[] = readonly AnyJob[],
+  /** What an enqueue resolves to: `AcceptedEnqueueResult` on a `StrictOutbox`, whose refusals throw. */
+  R extends EnqueueResult = EnqueueResult,
+> {
   /** Runs iff the caller's transaction commits; a duplicate `dedupeKey` returns the existing job. */
-  enqueue<T extends J[number]>(
-    tx: SqlRunner,
-    job: T,
-    request: EnqueueRequest<T>,
-  ): Promise<EnqueueResult>;
+  enqueue<T extends J[number]>(tx: SqlRunner, job: T, request: EnqueueRequest<T>): Promise<R>;
   /**
    * Runs `work` in `db.transaction` and nudges the jobs it created once that commits. A throw
    * rolls back and nudges nothing. Pass the top-level db, not a transaction (drizzle would open a
@@ -460,10 +515,10 @@ export interface Outbox<J extends readonly AnyJob[] = readonly AnyJob[]> {
    * nudge checks out a connection from `connect`: if `db` holds a client from that same pool, size
    * the pool for both, or pass a pool-backed db that releases its client when the commit returns.
    */
-  transaction<Tx extends SqlRunner, R>(
+  transaction<Tx extends SqlRunner, Result>(
     db: { transaction<T>(fn: (tx: Tx) => Promise<T>): Promise<T> },
-    work: (tx: Tx, enqueue: ScopedEnqueue<J>) => Promise<R>,
-  ): Promise<R>;
+    work: (tx: Tx, enqueue: ScopedEnqueue<J, R>) => Promise<Result>,
+  ): Promise<Result>;
   /** Call after commit; bare ids go to the default lane. Never throws. */
   nudge(jobs: readonly (string | { id: string; kind: string })[]): Promise<void>;
   cancel(
@@ -488,6 +543,22 @@ export interface Outbox<J extends readonly AnyJob[] = readonly AnyJob[]> {
   /** Not part of the public API. */
   readonly [RUNTIME]: OutboxRuntime;
 }
+
+/** `ScopedEnqueue` of a strict outbox: a refusal throws `EnqueueRefusedError`, so it resolves only to an accepted result. */
+export type StrictScopedEnqueue<J extends readonly AnyJob[]> = ScopedEnqueue<
+  J,
+  AcceptedEnqueueResult
+>;
+
+/**
+ * What `createOutbox({ strictEnqueue: true })` returns: an `Outbox` whose enqueues (`enqueue`,
+ * `transaction`'s, a `run` schedule's) throw `EnqueueRefusedError` on a refusal. Assignable to
+ * `Outbox`, so every helper taking one accepts it.
+ */
+export type StrictOutbox<J extends readonly AnyJob[] = readonly AnyJob[]> = Outbox<
+  J,
+  AcceptedEnqueueResult
+>;
 
 /** Jobs a transaction created, by nudge delay in seconds, awaiting their post-commit nudge. */
 export type PendingNudges = Map<number, { id: string; kind: string }[]>;

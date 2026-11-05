@@ -1,4 +1,4 @@
-import type { AnyJob } from '../core/define-job';
+import type { AnyJob, JobContext } from '../core/define-job';
 import type { ClaimedJob } from '../store/outbox-store';
 import type { Clock, OutboxDb } from './types';
 
@@ -25,12 +25,16 @@ export async function executeHandler(input: {
   const controller = new AbortController();
   // Closed once the handler is done: a stray query must not land inside the settle transaction.
   const handlerDb = closable(input.db);
-  const ctx = {
+  // The same instant the timer below measures from, on the injected clock.
+  const deadline = input.clock.nowMs() + job.timeoutMs;
+  const ctx: JobContext = {
     jobId: claimed.id,
     kind: claimed.kind,
     attempt: claimed.attemptNo,
     idempotencyKey: claimed.id,
     signal: controller.signal,
+    deadline,
+    remainingMs: () => Math.max(0, deadline - input.clock.nowMs()),
     deps: input.deps,
     tenantKey: claimed.tenantKey,
     correlationId: claimed.correlationId,
@@ -41,6 +45,16 @@ export async function executeHandler(input: {
   // Validation runs inside the timed attempt: an async validator is part of the lease's work.
   // Set by the timer itself, so a validation that resolves after the timeout can't slip through.
   let expired = false;
+  // Armed before the attempt starts: a synchronous validator runs before `run`'s first await, and
+  // must count against `timeoutMs` (and `ctx.deadline`) like the rest of the attempt.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<{ settled: 'timeout' }>((resolve) => {
+    timer = setTimeout(() => {
+      expired = true;
+      resolve({ settled: 'timeout' });
+    }, job.timeoutMs);
+  });
+
   const run = (async (): Promise<Settled> => {
     const validated = await validatePayload(job, claimed.payload);
 
@@ -62,14 +76,6 @@ export async function executeHandler(input: {
       return { settled: 'error', error };
     }
   })();
-
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<{ settled: 'timeout' }>((resolve) => {
-    timer = setTimeout(() => {
-      expired = true;
-      resolve({ settled: 'timeout' });
-    }, job.timeoutMs);
-  });
 
   const first = await Promise.race([run, timeout]);
   clearTimeout(timer);

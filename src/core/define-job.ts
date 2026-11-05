@@ -1,5 +1,7 @@
 import type { StandardSchemaV1 } from '@standard-schema/spec';
 
+import type { OutboxDb } from '../runtime/types';
+
 import { retry, type HandlerOutcome } from './outcome';
 import { resolveRetryPolicy, type RetryPolicy, type RetryPolicyInput } from './retry-policy';
 
@@ -25,8 +27,33 @@ export interface JobContext<Deps = unknown> {
   readonly attempt: number;
   /** Stable across attempts; delivery is at-least-once, so pass it to providers that dedupe. */
   readonly idempotencyKey: string;
-  /** Aborts at `timeoutMs`; pass it to every I/O call. */
+  /**
+   * Aborts once the attempt has been settled as `timeout`, to stop abandoned I/O: pass it to every
+   * I/O call. A result returned after the abort is discarded, so to stop early and still return
+   * `ok()`, watch `deadline` / `remainingMs()` instead.
+   */
   readonly signal: AbortSignal;
+  /**
+   * Epoch ms, on the outbox's clock, at which this attempt is settled as `timeout`: the attempt's
+   * start plus `timeoutMs` (payload validation counts against it). Return before it, with room
+   * for the work after your last check, and enqueue the rest as a continuation.
+   */
+  readonly deadline: number;
+  /**
+   * Milliseconds left until `deadline` on the outbox's clock, never below 0. A test clock moves it
+   * only when advanced; the timeout itself is real time.
+   */
+  remainingMs(): number;
+  /**
+   * The lane's own session (the outbox's `connect`, its role and Hyperdrive config), not your
+   * app's database. Fenced: once the attempt returns or is settled as `timeout`, every method call
+   * on it, on a `tx` from its `transaction()`, or on a captured method rejects. A query builder
+   * created before that and awaited after it is not covered. Typed as the minimal `OutboxDb`; the
+   * object is whatever your connector's `db` is (e.g. a drizzle database). Never await an external
+   * call inside `ctx.db.transaction()`; for writes that must commit with the job's completion, use
+   * `ok({ commit })`.
+   */
+  readonly db: OutboxDb;
   readonly deps: Deps;
   readonly tenantKey: string | null;
   readonly correlationId: string | null;
@@ -39,8 +66,11 @@ export interface JobDefinitionInput<K extends string, S extends StandardSchemaV1
   timeoutMs: number;
   lane?: string;
   retry?: RetryPolicyInput;
-  /** Default: retry with code `unexpected`. */
-  classify?: (error: unknown) => HandlerOutcome;
+  /**
+   * Maps a thrown error to an outcome. Return `undefined` to fall back to `defaultClassify` (retry
+   * with code `unexpected`), which is also the default when `classify` is omitted.
+   */
+  classify?: (error: unknown) => HandlerOutcome | undefined;
   handle: (payload: StandardSchemaV1.InferOutput<S>, ctx: JobContext<D>) => Promise<HandlerOutcome>;
 }
 
@@ -103,7 +133,7 @@ export function defineJob<K extends string, S extends StandardSchemaV1, D = unkn
     graceMs: HANDLER_GRACE_MS,
     leaseMs: input.timeoutMs + HANDLER_GRACE_MS + LEASE_MARGIN_MS,
     retry: resolveRetryPolicy(input.retry),
-    classify: input.classify ?? defaultClassify,
+    classify: withDefaultClassify(input.classify),
     handle: input.handle,
   };
 }
@@ -122,8 +152,19 @@ export function defineJobFor<D>() {
   ): JobDefinition<K, S, D> => defineJob<K, S, D>(input);
 }
 
-function defaultClassify(error: unknown): HandlerOutcome {
+/** What a thrown error becomes when `classify` is omitted or returns `undefined`: retry with code `unexpected`. */
+export function defaultClassify(error: unknown): HandlerOutcome {
   return retry({ code: 'unexpected', message: errorMessage(error) });
+}
+
+function withDefaultClassify(
+  classify: JobDefinitionInput<string, StandardSchemaV1, unknown>['classify'],
+) {
+  if (!classify) {
+    return defaultClassify;
+  }
+
+  return (error: unknown) => classify(error) ?? defaultClassify(error);
 }
 
 function errorMessage(error: unknown) {

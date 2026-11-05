@@ -104,7 +104,7 @@ export const welcomeEmail = defineJob({
   timeoutMs: 30_000,
   async handle({ userId }, ctx) {
     await sendWelcomeEmail(userId, {
-      signal: ctx.signal, // aborts at timeoutMs
+      signal: ctx.signal, // aborts once the attempt has timed out
       idempotencyKey: ctx.idempotencyKey, // stable across retries: delivery is at-least-once
     });
 
@@ -212,9 +212,29 @@ export const welcomeEmail = defineJob({
   // Maps a thrown error to an outcome.
   classify: (err) => (isHttp4xx(err) ? fail({ code: 'http_4xx' }) : retry({ code: 'unexpected' })),
   async handle({ userId }, ctx) {
-    // ctx: jobId, kind, attempt, idempotencyKey, signal, deps, tenantKey, correlationId, metadata
+    // ctx: jobId, kind, attempt, idempotencyKey, signal, deadline, remainingMs(), db, deps,
+    //      tenantKey, correlationId, metadata
     await sendWelcomeEmail(userId, { signal: ctx.signal, idempotencyKey: ctx.idempotencyKey });
 
+    return ok();
+  },
+});
+```
+
+To special-case one error and keep the default for the rest, return `undefined` from `classify` (or call the exported `defaultClassify` yourself):
+
+```ts
+import { defineJob, ok, retry } from '@makerkit/workers-outbox';
+import { z } from 'zod';
+
+export const nightlyPurge = defineJob({
+  kind: 'retention.nightly',
+  payload: z.object({ day: z.string() }),
+  timeoutMs: 60_000,
+  // 55P03 (lock_not_available): give way and come back; anything else gets the default.
+  classify: (err) =>
+    (err as { code?: string }).code === '55P03' ? retry({ code: 'yielded' }) : undefined,
+  async handle() {
     return ok();
   },
 });
@@ -297,6 +317,42 @@ const user = await outbox.transaction(db, async (tx, enqueue) => {
   return user;
 });
 ```
+
+Or let the outbox throw: with `createOutbox({ …, strictEnqueue: true })`, `enqueue`, `transaction`'s `enqueue` and a `run` schedule's `enqueue` throw `EnqueueRefusedError` (its `result` is the refusal) instead, so the business write rolls back with it. The result is then typed as created or exists, and the `StrictOutbox` it returns is accepted wherever an `Outbox` is (`runUntilIdle`, `createQueueHandler`, `createScheduledHandler`):
+
+```ts
+import { createOutbox, EnqueueRefusedError } from '@makerkit/workers-outbox';
+import { createPgConnector } from '@makerkit/workers-outbox/pg';
+
+import { db } from './db';
+import { welcomeEmail } from './jobs';
+import { createMailer } from './mailer';
+import { insertUser } from './users';
+
+const strict = createOutbox({
+  jobs: [welcomeEmail],
+  deps: { mailer: createMailer(env) },
+  connect: createPgConnector(env.OUTBOX_DB.connectionString),
+  strictEnqueue: true,
+});
+
+try {
+  await strict.transaction(db, async (tx, enqueue) => {
+    const user = await insertUser(tx, input);
+    const job = await enqueue(welcomeEmail, {
+      payload: { userId: user.id },
+      dedupeKey: `welcome:${user.id}`,
+    });
+
+    return job.id; // `created` or `exists`: a refusal threw and rolled back the user
+  });
+} catch (error) {
+  if (error instanceof EnqueueRefusedError) console.error(error.result.status);
+  throw error;
+}
+```
+
+In a `run` schedule, a strict refusal fails the whole occurrence (rolled back, `schedule_failed`) where a lenient one counts it as `rejected` and commits the rest.
 
 `enqueue` returns one of:
 
@@ -384,6 +440,74 @@ export const outboxFor = (env: Env) =>
 A hook that throws rolls the transition back and retries the job with code `hook_failed`, which spends its retry budget, so a hook that always throws ends the job dead rather than looping. Keep hooks to quick database writes: no external calls inside the transaction.
 
 **Chaining jobs.** For multi-step work, have each step's handler do one thing, and enqueue the next step from the request that starts the chain, or from your own code once a step's result is committed. Each step gets its own retries, timeout and dedupe key.
+
+## Long work: stopping at the deadline
+
+An attempt that is still running at `timeoutMs` is settled as `timeout`, and whatever it returns later is discarded: `ctx.signal` aborts only then, to stop abandoned I/O. To work in slices, stop _before_ the limit and hand the rest to a continuation. `ctx.deadline` is the instant (epoch ms) the attempt times out and `ctx.remainingMs()` the time left, both on the outbox's clock. A test clock moves them only when the test advances it; the timeout itself is real time, so a handler looping on `remainingMs()` under a frozen clock runs until the real `timeoutMs` and times out. Check it before each unit of work, keeping a margin for the slowest unit and the return:
+
+```ts
+// src/jobs.ts
+import {
+  createOutbox,
+  defineJobFor,
+  ok,
+  type HandlerOutcome,
+  type Outbox,
+} from '@makerkit/workers-outbox';
+import { createPgConnector } from '@makerkit/workers-outbox/pg';
+import { z } from 'zod';
+
+import { deleteExpiredBatch } from './retention';
+
+// The outbox comes through deps, as a getter: it is created after its jobs.
+const defineJob = defineJobFor<{ getOutbox: () => Outbox }>();
+
+const BATCH = 1_000;
+const MARGIN_MS = 10_000; // the slowest batch, plus room to return
+
+export const purgeExpired = defineJob({
+  kind: 'retention.purge',
+  payload: z.object({ day: z.string(), step: z.number().int() }),
+  timeoutMs: 60_000,
+  async handle({ day, step }, ctx): Promise<HandlerOutcome> {
+    let deleted = BATCH;
+
+    // ctx.db is fenced: once the attempt has timed out, a straggling batch can't commit.
+    while (deleted === BATCH && ctx.remainingMs() > MARGIN_MS) {
+      deleted = await deleteExpiredBatch(ctx.db, BATCH);
+    }
+
+    if (deleted < BATCH) return ok(); // done
+
+    // Out of time with rows left: the next step commits together with this one's success.
+    return ok({
+      commit: async (tx) => {
+        const next = await ctx.deps.getOutbox().enqueue(tx, purgeExpired, {
+          payload: { day, step: step + 1 },
+          dedupeKey: `purge:${day}:${step + 1}`,
+        });
+
+        if (next.status !== 'created' && next.status !== 'exists') throw new Error(next.status);
+      },
+    });
+  },
+});
+
+export const outboxFor = (env: Env) => {
+  const outbox: Outbox = createOutbox({
+    jobs: [purgeExpired],
+    deps: { getOutbox: () => outbox },
+    connect: createPgConnector(env.OUTBOX_DB.connectionString),
+    queue: env.OUTBOX_QUEUE,
+  });
+
+  return outbox;
+};
+```
+
+A job enqueued in `commit` isn't nudged, so it runs on the next cron sweep. To start it at once, enqueue it with `ctx.deps.getOutbox().transaction(ctx.db, …)` before returning `ok()` instead: the step's dedupe key makes a retried step find the same continuation.
+
+`ctx.db` is the lane's own session: the outbox's `connect`, role and Hyperdrive config, not your app's database. It is typed as the minimal `OutboxDb`; the object is your connector's `db` (a drizzle database with the `./pg` connectors). Once the attempt returns or times out, every call on it, on a `tx` from its `transaction()` or on a captured method rejects; a query builder created before then and awaited after it is not covered. Never await an external call inside `ctx.db.transaction()`.
 
 ## Fine-grained retry rules
 
@@ -857,7 +981,7 @@ const dead = await listJobs(db, { status: 'dead', limit: 50, statementTimeoutMs:
 **Enqueueing**
 
 - **Derive `dedupeKey` from business identity**, such as `welcome:${user.id}` or `invoice.paid:${invoice.id}`, never from a random value. A retried request then finds its job instead of creating a second one. Keys are permanent per tenant, so to send something again on purpose, put the reason in the key (`reminder:${user.id}:${week}`).
-- **Check the `enqueue` result and throw on a rejection.** `invalid_payload` and `dedupe_conflict` are returned, not thrown; ignore them and the business row commits without its job.
+- **Check the `enqueue` result and throw on a rejection,** or use `strictEnqueue: true`. `invalid_payload` and `dedupe_conflict` are returned, not thrown by default; ignore them and the business row commits without its job.
 - **Pass the top-level `db` to `outbox.transaction`**, not a `tx`, or the nudge goes out before the real commit.
 - **Validate at the edge with the job's own schema** (`welcomeEmail.payload`) so a bad request fails before it opens a transaction, as in [the example Worker](examples/worker/src/index.ts).
 - **Enqueue references, not snapshots.** Put ids in the payload and read current state in the handler; store anything large in R2 and enqueue its key.
@@ -865,7 +989,7 @@ const dead = await listJobs(db, { status: 'dead', limit: 50, statementTimeoutMs:
 **Handlers**
 
 - **Make every handler idempotent.** Delivery is at-least-once: pass `ctx.idempotencyKey` to providers that dedupe, or record what you've done and check it first.
-- **Pass `ctx.signal` to every I/O call.** It fires at `timeoutMs`; a handler that ignores it keeps running after its attempt is already retried.
+- **Pass `ctx.signal` to every I/O call.** It fires once the attempt has been settled as `timeout`; a handler that ignores it keeps running after its attempt is already retried. A result after it is discarded: to stop early and still return `ok()`, watch `ctx.remainingMs()` ([long work](#long-work-stopping-at-the-deadline)).
 - **Return outcomes for errors you understand.** `fail` for permanent errors (4xx, validation), `retry({ after })` for `Retry-After`, `cancel` when the work is moot. Leave `classify`'s default `retry` for the unexpected.
 - **Set `timeoutMs` close to the real worst case.** The lease is derived from it, so an overgenerous timeout delays crash recovery, and a long lease can't run on the cron sweep.
 - **Never await an external call inside a database transaction**, whether yours or the one in `ok({ commit })` and `onTransition`. Do the network call first, then commit the bookkeeping.
@@ -928,6 +1052,7 @@ export const outboxFor = (env: Env) =>
 | `recordNudges`       | Record nudge results on the row (on the lane's idle connection when it holds one). Cron handoff nudges are always recorded: their cooldown reads `nudge_sent_at`.      |
 | `operationTimeoutMs` | Bound for one operator action (`cancel`, `replay`, `retryNow`, …): acquisition, SQL and close. Past it the connection is destroyed and the call rejects. Default 60 s. |
 | `maxPayloadBytes`    | Largest payload accepted, as JSON bytes. Default 256 KiB; larger ones return `invalid_payload`.                                                                        |
+| `strictEnqueue`      | `true`: enqueues throw `EnqueueRefusedError` instead of returning `invalid_payload` / `dedupe_conflict`, and `createOutbox` returns a `StrictOutbox`. Default `false`. |
 | `generateId`         | Job id generator. Default `uuidv7()`. Must return a UUID; prefer time-ordered ids for index locality.                                                                  |
 | `clock`              | For tests: see [Testing](#testing).                                                                                                                                    |
 
@@ -972,7 +1097,7 @@ pnpm test:load     # concurrency and recovery under load (OUTBOX_LOAD_JOBS, _WOR
 pnpm test:example  # examples/worker under wrangler dev (needs wrangler; WRANGLER=/path)
 pnpm oxlint
 pnpm format
-pnpm build         # tsdown → dist/
+pnpm build         # rolldown → dist/
 ```
 
 ## License
