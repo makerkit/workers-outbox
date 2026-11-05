@@ -43,7 +43,7 @@
     }
   },
   "scripts": {
-    "build": "tsdown",
+    "build": "rolldown -c",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
@@ -74,17 +74,18 @@
     }
   },
   "devDependencies": {
-    "@electric-sql/pglite": "^0.5.13",
+    "@electric-sql/pglite": "^0.5.15",
     "@types/node": "^26.6.4",
     "@types/pg": "^8.23.1",
     "drizzle-kit": "1.0.0-rc.4",
     "drizzle-orm": "1.0.0-rc.4",
-    "oxfmt": "^0.72.0",
-    "oxlint": "^1.87.0",
+    "oxfmt": "^0.76.0",
+    "oxlint": "^1.91.0",
     "pg": "^8.23.1",
-    "tsdown": "^0.23.1",
+    "rolldown": "^1.2.16",
+    "rolldown-plugin-dts": "^0.29.0",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.3",
+    "vitest": "^5.1.0",
     "zod": "^4.6.7"
   },
   "packageManager": "pnpm@12.16.1",

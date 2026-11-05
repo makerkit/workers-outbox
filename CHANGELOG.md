@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.1 — 2026-11-04
+## 0.0.1 — 2026-11-05
 
 Initial release of `@makerkit/workers-outbox`: a transactional outbox for Postgres on Cloudflare Workers (Hyperdrive + Queues + Cron Triggers).
 

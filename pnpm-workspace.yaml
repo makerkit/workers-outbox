@@ -1,3 +1,10 @@
 # esbuild (pulled in by drizzle-kit, dev-only) works from its prebuilt optional binary.
 allowBuilds:
   esbuild: false
+permissions:
+  drizzle-kit:
+    skills: true
+
+skills:
+  dirs:
+    - .claude/skills
