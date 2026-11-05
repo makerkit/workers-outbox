@@ -5,6 +5,8 @@ import type { ClaimableKind } from '../core/registry';
 import type { AttemptOutcome, AttemptTrigger, JobStatus } from '../core/status';
 import type { Transition } from '../core/transition';
 
+import { TERMINAL_STATUSES } from '../core/status';
+import { isUuid } from '../core/uuid';
 import { queryRows, type SqlRunner } from '../drizzle/catalog';
 
 // Every statement is one autocommit-safe statement (Hyperdrive shares a session per connection),
@@ -74,19 +76,8 @@ export interface KindFilter extends ClaimableKind {
   readonly fits: boolean;
 }
 
-export interface ExpiredLease {
-  id: string;
-  kind: string;
-  leaseToken: string;
-  spentAttempts: number;
-  codeStreak: number;
-  lastErrorCode: string | null;
-  stickyCode?: string | null;
-  tenantKey: string | null;
-  correlationId: string | null;
-  metadata: Record<string, unknown>;
-  attemptNo: number;
-}
+/** A claim whose lease ran out: recovery settles it without reading the payload. */
+export type ExpiredLease = Omit<ClaimedJob, 'payload'>;
 
 /** `undefined` = every tenant, `null` = untenanted only; out-of-scope jobs read as `not_found`. */
 export type TenantScope = string | null | undefined;
@@ -98,7 +89,8 @@ const MAX_MESSAGE_LENGTH = 2_000;
 
 const MAX_NUDGE_ERROR_LENGTH = 500;
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isTerminal = (status: JobStatus) =>
+  (TERMINAL_STATUSES as readonly JobStatus[]).includes(status);
 
 const dbNow = (now: Date | null) =>
   sql`COALESCE(${now?.toISOString() ?? null}::timestamptz, now())`;
@@ -222,9 +214,9 @@ export async function claimByIds(
   },
 ): Promise<ClaimByIdResult[]> {
   const ids = [...new Set(input.ids)];
-  const valid = ids.filter((id) => UUID_PATTERN.test(id));
+  const valid = ids.filter((id) => isUuid(id));
   const invalid = ids
-    .filter((id) => !UUID_PATTERN.test(id))
+    .filter((id) => !isUuid(id))
     .map((id) => ({ id, result: 'not_found' as const }));
 
   if (valid.length === 0 || input.kinds.length === 0) {
@@ -297,7 +289,7 @@ export async function settleJob(
   const stickyCode = failure?.stickyCode ?? null;
   const reason = t.to === 'dead' || t.to === 'cancelled' ? t.reason : null;
   const delayMs = t.to === 'retrying' ? t.delayMs : 0;
-  const isTerminal = t.to !== 'retrying';
+  const finishes = t.to !== 'retrying';
   const expiredClause = input.requireExpiredLease
     ? sql` AND leased_until < (SELECT t FROM clock)`
     : sql``;
@@ -318,7 +310,7 @@ export async function settleJob(
             last_error_code = COALESCE(${code}, last_error_code),
             last_error_message = ${code === null ? sql`last_error_message` : sql`${message}`},
             terminal_reason = ${reason},
-            finished_at = ${isTerminal ? sql`(SELECT t FROM clock)` : sql`NULL`},
+            finished_at = ${finishes ? sql`(SELECT t FROM clock)` : sql`NULL`},
             updated_at = (SELECT t FROM clock)
           WHERE id = ${input.jobId} AND lease_token = ${input.leaseToken} AND status = 'processing'${expiredClause}
           RETURNING id, started_attempts
@@ -345,7 +337,7 @@ export async function isLeaseHeld(
   db: SqlRunner,
   input: { jobId: string; leaseToken: string; now: Date | null; requireExpiredLease?: boolean },
 ) {
-  if (!UUID_PATTERN.test(input.jobId) || !UUID_PATTERN.test(input.leaseToken)) {
+  if (!isUuid(input.jobId) || !isUuid(input.leaseToken)) {
     return false;
   }
 
@@ -460,7 +452,7 @@ export async function cancelJob(
     tenantKey?: TenantScope;
   },
 ) {
-  if ('id' in input.ref && !UUID_PATTERN.test(input.ref.id)) {
+  if ('id' in input.ref && !isUuid(input.ref.id)) {
     return 'not_found' as const;
   }
 
@@ -469,66 +461,33 @@ export async function cancelJob(
       ? sql`id = ${input.ref.id}`
       : sql`dedupe_key = ${input.ref.dedupeKey} AND tenant_key IS NOT DISTINCT FROM ${input.ref.tenantKey}`;
 
-  const rows = await queryRows<{ status: JobStatus; cancelled: boolean }>(
-    db,
-    sql`WITH clock AS (SELECT ${dbNow(input.now)} AS t),
-        target AS (SELECT id, status FROM "outbox"."job" WHERE ${match}${tenantClause(sql`tenant_key`, input.tenantKey)}),
-        updated AS (
-          UPDATE "outbox"."job" SET status = 'cancelled', terminal_reason = ${input.reason},
-            next_attempt_at = NULL, finished_at = (SELECT t FROM clock), updated_at = (SELECT t FROM clock)
-          WHERE id IN (SELECT id FROM target) AND status IN ('pending', 'retrying')
-          RETURNING id
-        )
-        SELECT target.status, (updated.id IS NOT NULL) AS cancelled
-        FROM target LEFT JOIN updated USING (id)`,
-  );
+  const [row] = await updateMatching(db, {
+    match,
+    tenantKey: input.tenantKey,
+    now: input.now,
+    ...cancellation(input.reason),
+  });
 
-  const row = rows[0];
-
-  if (!row) {
-    return 'not_found' as const;
-  }
-
-  if (row.cancelled) {
-    return 'cancelled' as const;
-  }
-
-  return row.status === 'succeeded' || row.status === 'dead' || row.status === 'cancelled'
-    ? ('already_terminal' as const)
-    : ('in_flight' as const);
+  return row ? cancelResult(row) : ('not_found' as const);
 }
 
-/** Fresh retry budget; the attempt ledger keeps its numbering. */
+/** Dead or cancelled → pending, with a fresh retry budget. */
 export async function replayJob(
   db: SqlRunner,
   input: { id: string; now: Date | null; tenantKey?: TenantScope },
 ) {
-  if (!UUID_PATTERN.test(input.id)) {
+  if (!isUuid(input.id)) {
     return 'not_found' as const;
   }
 
-  const rows = await queryRows<{ status: JobStatus; replayed: boolean }>(
-    db,
-    sql`WITH clock AS (SELECT ${dbNow(input.now)} AS t),
-        target AS (SELECT id, status FROM "outbox"."job" WHERE id = ${input.id}${tenantClause(sql`tenant_key`, input.tenantKey)}),
-        updated AS (
-          UPDATE "outbox"."job" SET status = 'pending', available_at = (SELECT t FROM clock),
-            next_attempt_at = NULL, terminal_reason = NULL, finished_at = NULL,
-            spent_attempts = 0, code_streak = 0, sticky_code = NULL, updated_at = (SELECT t FROM clock)
-          WHERE id IN (SELECT id FROM target) AND status IN ('dead', 'cancelled')
-          RETURNING id
-        )
-        SELECT target.status, (updated.id IS NOT NULL) AS replayed
-        FROM target LEFT JOIN updated USING (id)`,
-  );
+  const [row] = await updateMatching(db, {
+    match: sql`id = ${input.id}`,
+    tenantKey: input.tenantKey,
+    now: input.now,
+    ...REPLAY,
+  });
 
-  const row = rows[0];
-
-  if (!row) {
-    return 'not_found' as const;
-  }
-
-  return row.replayed ? ('replayed' as const) : ('not_replayable' as const);
+  return row ? replayResult(row) : ('not_found' as const);
 }
 
 export async function deleteFinishedJobs(
@@ -705,7 +664,6 @@ const optional = <T>(value: T | undefined, clause: (value: T) => SQL) =>
 const jobFilter = (filter: JobFilter) =>
   sql`j.status = ${filter.status}${optional(filter.kind, (v) => sql` AND j.kind = ${v}`)}${tenantClause(sql`j.tenant_key`, filter.tenantKey)}${optional(filter.dedupeKey, (v) => sql` AND j.dedupe_key = ${v}`)}${optional(filter.terminalReason, (v) => sql` AND j.terminal_reason = ${v}`)}${optional(filter.createdAfter, (v) => sql` AND j.created_at > ${v.toISOString()}::timestamptz`)}${optional(filter.createdBefore, (v) => sql` AND j.created_at < ${v.toISOString()}::timestamptz`)}${optional(filter.finishedAfter, (v) => sql` AND j.finished_at > ${v.toISOString()}::timestamptz`)}${optional(filter.finishedBefore, (v) => sql` AND j.finished_at < ${v.toISOString()}::timestamptz`)}`;
 
-/** Keyset-paginated: pass `nextCursor` back as `cursor`. */
 const jobSummaryColumns = sql`j.id, j.kind, j.status, j.dedupe_key, j.tenant_key, j.correlation_id, j.metadata,
   j.started_attempts, j.finished_attempts, j.spent_attempts, j.code_streak, j.sticky_code,
   j.last_error_code, j.last_error_message, j.terminal_reason, j.nudge_attempts, j.last_nudge_error,
@@ -714,6 +672,7 @@ const jobSummaryColumns = sql`j.id, j.kind, j.status, j.dedupe_key, j.tenant_key
   ${epochMs(sql`j.updated_at`)} AS updated_at, ${epochMs(sql`j.finished_at`)} AS finished_at,
   ${epochMs(sql`j.nudge_sent_at`)} AS nudge_sent_at, now() AS read_at`;
 
+/** Keyset-paginated: pass `nextCursor` back as `cursor`. */
 export async function listJobs(
   db: SqlRunner,
   input: JobFilter & { limit: number; cursor?: string | null },
@@ -819,7 +778,7 @@ export async function recordNudgeResult(
   db: SqlRunner,
   input: { ids: readonly string[]; error: string | null; now: Date | null },
 ) {
-  const ids = [...new Set(input.ids)].filter((id) => UUID_PATTERN.test(id));
+  const ids = [...new Set(input.ids)].filter((id) => isUuid(id));
 
   if (ids.length === 0) {
     return 0;
@@ -911,7 +870,7 @@ function toJobSummary(row: JobSummaryRow): JobSummary {
 function parseCursor(cursor: string) {
   const [createdAt = '', id = ''] = cursor.split('|');
 
-  if (!UUID_PATTERN.test(id) || Number.isNaN(Date.parse(createdAt))) {
+  if (!isUuid(id) || Number.isNaN(Date.parse(createdAt))) {
     throw new Error(`listJobs: invalid cursor ${JSON.stringify(cursor)}`);
   }
 
@@ -995,7 +954,7 @@ function firstRow<Row>(rows: Row[], statement: string) {
 
 /** One job with its attempt ledger, for an operator view. Payload excluded. */
 export async function getJob(db: SqlRunner, input: { id: string; tenantKey?: TenantScope }) {
-  if (!UUID_PATTERN.test(input.id)) {
+  if (!isUuid(input.id)) {
     return null;
   }
 
@@ -1038,7 +997,7 @@ export async function getJob(db: SqlRunner, input: { id: string; tenantKey?: Ten
       message: a.message,
       durationMs: a.duration_ms,
       startedAt: new Date(a.started_at),
-      finishedAt: a.finished_at === null ? null : new Date(a.finished_at),
+      finishedAt: toDate(a.finished_at),
     })),
   };
 }
@@ -1065,35 +1024,26 @@ export async function rescheduleNow(
   db: SqlRunner,
   input: { id: string; now: Date | null; tenantKey?: TenantScope },
 ) {
-  if (!UUID_PATTERN.test(input.id)) {
+  if (!isUuid(input.id)) {
     return { result: 'not_found' as const, kind: null };
   }
 
-  const rows = await queryRows<{ status: JobStatus; kind: string; rescheduled: boolean }>(
-    db,
-    sql`WITH clock AS (SELECT ${dbNow(input.now)} AS t),
-        target AS (SELECT id, status, kind FROM "outbox"."job"
-                   WHERE id = ${input.id}${tenantClause(sql`tenant_key`, input.tenantKey)}),
-        updated AS (
-          UPDATE "outbox"."job" SET
-            available_at = CASE WHEN status = 'pending' THEN (SELECT t FROM clock) ELSE available_at END,
-            next_attempt_at = CASE WHEN status = 'retrying' THEN (SELECT t FROM clock) ELSE next_attempt_at END,
-            updated_at = (SELECT t FROM clock)
-          WHERE id IN (SELECT id FROM target) AND status IN ('pending', 'retrying')
-          RETURNING id
-        )
-        SELECT target.status, target.kind, (updated.id IS NOT NULL) AS rescheduled
-        FROM target LEFT JOIN updated USING (id)`,
-  );
-
-  const row = rows[0];
+  const [row] = await updateMatching(db, {
+    match: sql`id = ${input.id}`,
+    tenantKey: input.tenantKey,
+    now: input.now,
+    set: sql`available_at = CASE WHEN status = 'pending' THEN (SELECT t FROM clock) ELSE available_at END,
+        next_attempt_at = CASE WHEN status = 'retrying' THEN (SELECT t FROM clock) ELSE next_attempt_at END,
+        updated_at = (SELECT t FROM clock)`,
+    allowed: WAITING,
+  });
 
   if (!row) {
     return { result: 'not_found' as const, kind: null };
   }
 
   return {
-    result: row.rescheduled ? ('rescheduled' as const) : ('not_waiting' as const),
+    result: row.done ? ('rescheduled' as const) : ('not_waiting' as const),
     kind: row.kind,
   };
 }
@@ -1115,27 +1065,14 @@ export async function deleteTenantJobs(db: SqlRunner, input: { tenantKey: string
   return firstRow(rows, 'deleteTenantJobs').deleted;
 }
 
-type BulkCancelResult = 'cancelled' | 'in_flight' | 'already_terminal' | 'not_found';
-type BulkReplayResult = 'replayed' | 'not_replayable' | 'not_found';
-
 /** Cancels many waiting jobs in one statement; every requested id gets a result. */
 export async function cancelJobs(
   db: SqlRunner,
   input: { ids: readonly string[]; reason: string; now: Date | null; tenantKey?: TenantScope },
 ) {
-  const rows = await bulkUpdate(
-    db,
-    input.ids,
-    input.tenantKey,
-    input.now,
-    sql`status = 'cancelled', terminal_reason = ${input.reason}, next_attempt_at = NULL,
-        finished_at = (SELECT t FROM clock), updated_at = (SELECT t FROM clock)`,
-    sql`status IN ('pending', 'retrying')`,
-  );
+  const rows = await updateByIds(db, input, cancellation(input.reason));
 
-  return mapBulk<BulkCancelResult>(input.ids, rows, (row) =>
-    row.done ? 'cancelled' : TERMINAL.has(row.status) ? 'already_terminal' : 'in_flight',
-  );
+  return mapBulk(input.ids, rows, cancelResult);
 }
 
 /** Replays many dead or cancelled jobs in one statement, each with a fresh budget. */
@@ -1143,59 +1080,96 @@ export async function replayJobs(
   db: SqlRunner,
   input: { ids: readonly string[]; now: Date | null; tenantKey?: TenantScope },
 ) {
-  const rows = await bulkUpdate(
-    db,
-    input.ids,
-    input.tenantKey,
-    input.now,
-    sql`status = 'pending', available_at = (SELECT t FROM clock), next_attempt_at = NULL,
+  const rows = await updateByIds(db, input, REPLAY);
+
+  return mapBulk(input.ids, rows, replayResult);
+}
+
+const WAITING = sql`status IN ('pending', 'retrying')`;
+
+/** An operator's state change: what it writes, and the statuses it may write over. */
+interface StatusChange {
+  set: SQL;
+  allowed: SQL;
+}
+
+const cancellation = (reason: string): StatusChange => ({
+  set: sql`status = 'cancelled', terminal_reason = ${reason}, next_attempt_at = NULL,
+        finished_at = (SELECT t FROM clock), updated_at = (SELECT t FROM clock)`,
+  allowed: WAITING,
+});
+
+// Fresh retry budget; the attempt ledger keeps its numbering.
+const REPLAY: StatusChange = {
+  set: sql`status = 'pending', available_at = (SELECT t FROM clock), next_attempt_at = NULL,
         terminal_reason = NULL, finished_at = NULL, spent_attempts = 0, code_streak = 0,
         sticky_code = NULL, updated_at = (SELECT t FROM clock)`,
-    sql`status IN ('dead', 'cancelled')`,
-  );
+  allowed: sql`status IN ('dead', 'cancelled')`,
+};
 
-  return mapBulk<BulkReplayResult>(input.ids, rows, (row) =>
-    row.done ? 'replayed' : 'not_replayable',
+interface MatchedRow {
+  id: string;
+  kind: string;
+  status: JobStatus;
+  /** The change applied: the row's status allowed it. */
+  done: boolean;
+}
+
+const cancelResult = (row: MatchedRow) =>
+  row.done
+    ? ('cancelled' as const)
+    : isTerminal(row.status)
+      ? ('already_terminal' as const)
+      : ('in_flight' as const);
+
+const replayResult = (row: MatchedRow) =>
+  row.done ? ('replayed' as const) : ('not_replayable' as const);
+
+/** One statement: every matching job (in the tenant scope) reports its status, and whether it changed. */
+function updateMatching(
+  db: SqlRunner,
+  input: StatusChange & { match: SQL; tenantKey: TenantScope; now: Date | null },
+) {
+  return queryRows<MatchedRow>(
+    db,
+    sql`WITH clock AS (SELECT ${dbNow(input.now)} AS t),
+        target AS (
+          SELECT id, kind, status FROM "outbox"."job"
+          WHERE ${input.match}${tenantClause(sql`tenant_key`, input.tenantKey)}
+        ),
+        updated AS (
+          UPDATE "outbox"."job" SET ${input.set}
+          WHERE id IN (SELECT id FROM target) AND ${input.allowed}
+          RETURNING id
+        )
+        SELECT target.id::text AS id, target.kind, target.status, (updated.id IS NOT NULL) AS done
+        FROM target LEFT JOIN updated USING (id)`,
   );
 }
 
-const TERMINAL = new Set<JobStatus>(['succeeded', 'dead', 'cancelled']);
-
-async function bulkUpdate(
+async function updateByIds(
   db: SqlRunner,
-  ids: readonly string[],
-  tenantKey: TenantScope,
-  now: Date | null,
-  set: SQL,
-  allowed: SQL,
+  input: { ids: readonly string[]; now: Date | null; tenantKey?: TenantScope },
+  change: StatusChange,
 ) {
-  const valid = [...new Set(ids)].filter((id) => UUID_PATTERN.test(id));
+  const valid = [...new Set(input.ids)].filter((id) => isUuid(id));
 
   if (valid.length === 0) {
     return [];
   }
 
-  return queryRows<{ id: string; status: JobStatus; done: boolean }>(
-    db,
-    sql`WITH clock AS (SELECT ${dbNow(now)} AS t),
-        target AS (
-          SELECT id, status FROM "outbox"."job"
-          WHERE id = ANY(${uuidArray(valid)})${tenantClause(sql`tenant_key`, tenantKey)}
-        ),
-        updated AS (
-          UPDATE "outbox"."job" SET ${set}
-          WHERE id IN (SELECT id FROM target) AND ${allowed}
-          RETURNING id
-        )
-        SELECT target.id::text AS id, target.status, (updated.id IS NOT NULL) AS done
-        FROM target LEFT JOIN updated USING (id)`,
-  );
+  return updateMatching(db, {
+    ...change,
+    match: sql`id = ANY(${uuidArray(valid)})`,
+    tenantKey: input.tenantKey,
+    now: input.now,
+  });
 }
 
 function mapBulk<R extends string>(
   ids: readonly string[],
-  rows: { id: string; status: JobStatus; done: boolean }[],
-  decide: (row: { status: JobStatus; done: boolean }) => R,
+  rows: MatchedRow[],
+  decide: (row: MatchedRow) => R,
 ) {
   const byId = new Map(rows.map((row) => [row.id, row]));
   const results: Record<string, R | 'not_found'> = {};

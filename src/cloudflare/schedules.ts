@@ -8,7 +8,7 @@ import type {
 import type { OutboxDb } from '../runtime/types';
 
 import { RUNTIME } from '../runtime/create-outbox';
-import { isConnectionError, isTransientDbError } from '../runtime/db-errors';
+import { isTransientDbError } from '../runtime/db-errors';
 import { serializeError } from '../runtime/serialize-error';
 
 /** One firing of a schedule's cron. */
@@ -163,9 +163,11 @@ export async function runSchedules(
         break;
       } catch (error) {
         const delay = RETRY_DELAYS_MS[attempt - 1];
-        const transient = isTransientDbError(error) || isConnectionError(error);
-
-        if (transient && delay !== undefined && runtime.nowMs() + delay < deadlineAt) {
+        if (
+          isTransientDbError(error) &&
+          delay !== undefined &&
+          runtime.nowMs() + delay < deadlineAt
+        ) {
           await runtime.sleep(delay);
           continue;
         }

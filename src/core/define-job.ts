@@ -2,6 +2,7 @@ import type { StandardSchemaV1 } from '@standard-schema/spec';
 
 import type { OutboxDb } from '../runtime/types';
 
+import { errorMessage } from './error-message';
 import { retry, type HandlerOutcome } from './outcome';
 import { resolveRetryPolicy, type RetryPolicy, type RetryPolicyInput } from './retry-policy';
 
@@ -165,12 +166,4 @@ function withDefaultClassify(
   }
 
   return (error: unknown) => classify(error) ?? defaultClassify(error);
-}
-
-function errorMessage(error: unknown) {
-  if (error instanceof Error) {
-    return error.message;
-  }
-
-  return String(error);
 }

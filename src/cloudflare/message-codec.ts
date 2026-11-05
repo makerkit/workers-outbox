@@ -1,6 +1,6 @@
 import type { OutboxMessage } from '../runtime/types';
 
-const MAX_REJECTED_BODY = 500;
+const MAX_BODY_PREVIEW = 500;
 
 export type DecodedMessage =
   | { ok: true; message: OutboxMessage }
@@ -36,6 +36,11 @@ export function decodeMessage(body: unknown): DecodedMessage {
 }
 
 function reject(reason: 'malformed' | 'unknown_version', body: unknown): DecodedMessage {
+  return { ok: false, reason, body: previewBody(body) };
+}
+
+/** A message body as bounded text for an event: its JSON form, or its string form if it has none. */
+export function previewBody(body: unknown) {
   let text: string;
 
   try {
@@ -44,5 +49,5 @@ function reject(reason: 'malformed' | 'unknown_version', body: unknown): Decoded
     text = String(body);
   }
 
-  return { ok: false, reason, body: text.slice(0, MAX_REJECTED_BODY) };
+  return text.slice(0, MAX_BODY_PREVIEW);
 }

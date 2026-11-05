@@ -2,6 +2,8 @@ import type { AnyJob, JobContext } from '../core/define-job';
 import type { ClaimedJob } from '../store/outbox-store';
 import type { Clock, OutboxDb } from './types';
 
+import { defaultClassify } from '../core/define-job';
+import { errorMessage } from '../core/error-message';
 import { retry, type HandlerOutcome, type SettleOutcome } from '../core/outcome';
 
 export interface ExecutionResult {
@@ -10,8 +12,6 @@ export interface ExecutionResult {
   /** Ran past its grace period: the lane's connection must not be reused. */
   runaway: boolean;
 }
-
-const OUTCOME_TYPES = new Set(['ok', 'retry', 'fail', 'cancel']);
 
 // A timeout is final: a late result is discarded so it can't race the retry.
 export async function executeHandler(input: {
@@ -134,7 +134,7 @@ async function validatePayload(
 
     return { ok: true, value: validated.value };
   } catch (error) {
-    return { ok: false, message: error instanceof Error ? error.message : String(error) };
+    return { ok: false, message: errorMessage(error) };
   }
 }
 
@@ -192,10 +192,7 @@ export function classifySafely(job: AnyJob, error: unknown): HandlerOutcome {
 
     return isHandlerOutcome(outcome) ? outcome : retry({ code: 'unexpected' });
   } catch {
-    return retry({
-      code: 'unexpected',
-      message: error instanceof Error ? error.message : String(error),
-    });
+    return defaultClassify(error);
   }
 }
 
@@ -211,20 +208,17 @@ function isHandlerOutcome(value: unknown): value is HandlerOutcome {
 
   const outcome = value as Record<string, unknown>;
 
-  if (!OUTCOME_TYPES.has(outcome['type'] as string)) {
-    return false;
-  }
-
   switch (outcome['type']) {
     case 'ok':
       return isOptional(outcome['commit'], 'function');
+    // A non-numeric `afterMs` is not checked: retry scheduling falls back to backoff.
     case 'retry':
-      // A non-numeric `afterMs` is not checked: retry scheduling falls back to backoff.
-      return isCode(outcome['code']) && isOptional(outcome['message'], 'string');
     case 'fail':
       return isCode(outcome['code']) && isOptional(outcome['message'], 'string');
-    default:
+    case 'cancel':
       return typeof outcome['reason'] === 'string';
+    default:
+      return false;
   }
 }
 

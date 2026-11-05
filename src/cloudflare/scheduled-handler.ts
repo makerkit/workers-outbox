@@ -1,8 +1,8 @@
 import type { Outbox } from '../runtime/create-outbox';
-import type { Budget, RunReport } from '../runtime/runtime';
+import type { Budget } from '../runtime/runtime';
 
 import { RUNTIME } from '../runtime/create-outbox';
-import { DEFAULT_RECOVERY_BUDGET_MS } from '../runtime/runtime';
+import { DEFAULT_RECOVERY_BUDGET_MS, emptyReport } from '../runtime/runtime';
 import { serializeError } from '../runtime/serialize-error';
 import {
   DEFAULT_SUCCEEDED_RETENTION_MS,
@@ -171,26 +171,9 @@ export function createScheduledHandler<Env, Ctx = unknown>(
       type: 'sweep_finished',
       cron,
       recovered: recovery ? recovery.retrying + recovery.dead : 0,
-      report: report ?? emptySweepReport(),
+      report: report ?? emptyReport(),
       deleted: deleted ?? 0,
       continued,
     });
-  };
-}
-
-function emptySweepReport(): RunReport {
-  return {
-    claimed: 0,
-    succeeded: 0,
-    retrying: 0,
-    dead: 0,
-    cancelled: 0,
-    leaseLost: 0,
-    settleFailed: 0,
-    byKind: {},
-    errored: 0,
-    erroredSamples: [],
-    reachedLimit: false,
-    reachedDeadline: false,
   };
 }

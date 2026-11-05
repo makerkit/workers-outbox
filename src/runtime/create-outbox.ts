@@ -6,7 +6,9 @@ import type { SqlRunner } from '../drizzle/catalog';
 import type { MessageRedactor } from './sanitize-message';
 
 import { LEASE_MARGIN_MS, type AnyJob, type JobDeps } from '../core/define-job';
+import { errorMessage } from '../core/error-message';
 import { createJobRegistry } from '../core/registry';
+import { isUuid } from '../core/uuid';
 import {
   cancelJob,
   deleteTenantJobs,
@@ -16,7 +18,8 @@ import {
   cancelJobs,
   replayJobs,
 } from '../store/outbox-store';
-import { settledWithin, unwrap, untilDeadline } from './deadline';
+import { acquireConnection, closeConnection, destroyConnection } from './connection';
+import { unwrap, untilDeadline } from './deadline';
 import { createEmitter, type EventSink } from './events';
 import {
   createRuntime,
@@ -96,8 +99,6 @@ export interface OutboxBaseOptions<J extends readonly AnyJob[]> {
    */
   version?: { timestamp: string | number; gateMs?: number };
 }
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const DEFAULT_VERSION_GATE_MS = 6 * 3_600_000;
 
@@ -242,32 +243,18 @@ export function createOutbox<const J extends readonly AnyJob[]>(
     invocationDeadlineAt = Infinity,
   ): Promise<T> => {
     const deadlineAt = Math.min(clock.nowMs() + operationTimeoutMs, invocationDeadlineAt);
-    const connecting = options.connect();
-    const got = await untilDeadline(clock, connecting, deadlineAt);
-
-    if (!got.done) {
-      void connecting.then(
-        (late) => late.destroy().catch(() => undefined),
-        () => undefined,
-      );
-    }
-
-    const connection = unwrap(got, 'connection acquisition');
+    const connection = await acquireConnection(() => options.connect(), clock, deadlineAt);
     const running = Promise.resolve().then(() => work(connection));
     const result = await untilDeadline(clock, running, deadlineAt);
 
     if (!result.done) {
       running.catch(() => undefined);
-      await settledWithin(connection.destroy(), 5_000);
+      await destroyConnection(connection);
 
       return unwrap(result, 'operator action');
     }
 
-    const closed = await settledWithin(connection.close(), 2_000);
-
-    if (!closed.done) {
-      void connection.destroy().catch(() => undefined);
-    }
+    await closeConnection(connection);
 
     return unwrap(result, 'operator action');
   };
@@ -354,7 +341,7 @@ export function createOutbox<const J extends readonly AnyJob[]>(
 
       const id = generateId();
 
-      if (!UUID_RE.test(id)) {
+      if (!isUuid(id)) {
         throw new Error(`outbox.enqueue: generateId returned ${JSON.stringify(id)}, not a UUID`);
       }
 
@@ -620,7 +607,7 @@ function toWire(
   } catch (error) {
     return {
       ok: false,
-      message: `payload is not JSON-serializable: ${error instanceof Error ? error.message : String(error)}`,
+      message: `payload is not JSON-serializable: ${errorMessage(error)}`,
     };
   }
 }

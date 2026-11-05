@@ -6,6 +6,7 @@ import type { SqlRunner } from '../drizzle/catalog';
 import type { Emit, OutboxEvent } from './events';
 
 import { DEFAULT_BACKLOG_AGED_MS, evaluateBacklog, type BacklogThresholds } from '../core/backlog';
+import { errorMessage } from '../core/error-message';
 import { HOOK_FAILED_CODE, retry, type SettleOutcome } from '../core/outcome';
 import { decideTransition, type JobBudgetState, type Transition } from '../core/transition';
 import {
@@ -25,8 +26,14 @@ import {
   type KindFilter,
   type VersionGate,
 } from '../store/outbox-store';
+import {
+  acquireConnection,
+  closeConnection,
+  destroyConnection,
+  discardConnection,
+} from './connection';
 import { isConnectionError, isTimeoutError, isTransientDbError, sqlstateOf } from './db-errors';
-import { DeadlineExceededError, settledWithin, unwrap, untilDeadline } from './deadline';
+import { unwrap, untilDeadline } from './deadline';
 import { classifySafely, executeHandler } from './execute-handler';
 import { sanitizeErrorMessage, type MessageRedactor } from './sanitize-message';
 import { serializeError } from './serialize-error';
@@ -106,7 +113,7 @@ const emptyTally = (): OutcomeTally => ({
   settleFailed: 0,
 });
 
-const emptyReport = (): RunReport => ({
+export const emptyReport = (): RunReport => ({
   ...emptyTally(),
   byKind: {},
   errored: 0,
@@ -130,11 +137,29 @@ function recordError(report: RunReport, error: unknown) {
   report.errored++;
 
   if (report.erroredSamples.length < MAX_ERROR_SAMPLES) {
-    report.erroredSamples.push(error instanceof Error ? error.message : String(error));
+    report.erroredSamples.push(errorMessage(error));
   }
 }
 
 export type Trigger = 'nudge' | 'sweep' | 'drain' | 'recovery';
+
+/** What an event reports about a database fault. */
+const dbFault = (error: unknown) => ({
+  dbCode: sqlstateOf(error),
+  transient: isTransientDbError(error),
+  error: serializeError(error),
+});
+
+/** A settlement that ran out of time: its outcome is unknown, and left to recovery. */
+const settlementExpired = (claimed: ClaimedJob): OutboxEvent => ({
+  type: 'settle_failed',
+  jobId: claimed.id,
+  kind: claimed.kind,
+  attemptNo: claimed.attemptNo,
+  dbCode: null,
+  transient: true,
+  error: serializeError(new Error('settlement deadline exceeded; outcome left to recovery')),
+});
 
 interface SettleContext {
   thrown: boolean;
@@ -201,11 +226,6 @@ const SETTLE_SAFETY_MS = 2_000;
 // The watchdog fires just after the native timeouts should have.
 const WATCHDOG_SLACK_MS = 1_000;
 
-const DESTROY_WAIT_MS = 5_000;
-
-// A healthy close() that never returns is abandoned, and the session destroyed instead.
-const CLOSE_WAIT_MS = 2_000;
-
 const QUEUE_SEND_TIMEOUT_MS = 10_000;
 
 // Settling a claim_late attempt: brief, fenced, and independent of the spent lease.
@@ -234,6 +254,13 @@ export const HANDOFF_COOLDOWN_MS = 15 * 60_000;
 export function createRuntime(config: RuntimeConfig) {
   const { registry, emit, clock } = config;
   const gate = config.version ? { version: config.version } : {};
+
+  // Lane names are caller strings: `constructor` must not resolve to an inherited member.
+  const queueFor = (lane: string) =>
+    Object.hasOwn(config.queues, lane) ? config.queues[lane] : undefined;
+
+  const phaseDeadline = (options: { deadlineAt?: number | undefined }) =>
+    options.deadlineAt ?? clock.nowMs() + DEFAULT_PHASE_DEADLINE_MS;
 
   const kindFilter = (remainingMs: number, scope: Scope = {}): KindFilter[] => {
     const lane = scope.lane === undefined ? {} : { lane: scope.lane };
@@ -277,28 +304,27 @@ export function createRuntime(config: RuntimeConfig) {
     }
   }
 
-  /**
-   * A lane owns one connection at a time. A runaway or timed-out session is destroyed — never
-   * returned to a pool — *before* its replacement is acquired, so a one-client pool still works.
-   */
+  /** One bounded statement on a short-lived lane: its session is destroyed if it overruns. */
+  async function onOneLane<T>(
+    what: string,
+    deadlineAt: number,
+    read: (db: OutboxDb) => PromiseLike<T>,
+  ): Promise<T> {
+    const [result] = await withLanes(
+      1,
+      (lane) => lane.bounded(() => read(lane.db), deadlineAt, what),
+      deadlineAt,
+    );
+
+    return result as T;
+  }
+
   /** Acquisition bounded by `deadlineAt`; a connection that arrives after it is destroyed. */
   async function acquire(deadlineAt: number, isWanted: () => boolean = () => true) {
-    const connecting = config.connect();
-    const got = await untilDeadline(clock, connecting, deadlineAt);
-
-    if (!got.done) {
-      void connecting.then(
-        (late) => late.destroy().catch(() => undefined),
-        () => undefined,
-      );
-
-      throw new DeadlineExceededError('connection acquisition');
-    }
-
-    const connection = unwrap(got, 'connection acquisition');
+    const connection = await acquireConnection(() => config.connect(), clock, deadlineAt);
 
     if (!isWanted()) {
-      void connection.destroy().catch(() => undefined);
+      discardConnection(connection);
 
       throw new Error('runtime: lane was retired while reconnecting');
     }
@@ -321,8 +347,7 @@ export function createRuntime(config: RuntimeConfig) {
       generation++;
 
       if (stale) {
-        // Destroying may wait on a runaway query; bound it, the session is unusable either way.
-        await settledWithin(stale.destroy(), DESTROY_WAIT_MS);
+        await destroyConnection(stale);
       }
     };
 
@@ -361,13 +386,7 @@ export function createRuntime(config: RuntimeConfig) {
 
           return true;
         } catch (error) {
-          emit({
-            type: 'infra_error',
-            operation: 'run_job',
-            dbCode: sqlstateOf(error),
-            transient: isTransientDbError(error),
-            error: serializeError(error),
-          });
+          emit({ type: 'infra_error', operation: 'run_job', ...dbFault(error) });
 
           return false;
         }
@@ -380,7 +399,7 @@ export function createRuntime(config: RuntimeConfig) {
 
         // Retired (or replaced) while this connect was in flight: the late session is not ours.
         if (retired || generation !== mine) {
-          void fresh.destroy().catch(() => undefined);
+          discardConnection(fresh);
 
           throw new Error('runtime: lane was retired while reconnecting');
         }
@@ -406,14 +425,8 @@ export function createRuntime(config: RuntimeConfig) {
         const open = connection;
         connection = null;
 
-        if (!open) {
-          return;
-        }
-
-        const closed = await settledWithin(open.close(), CLOSE_WAIT_MS);
-
-        if (!closed.done) {
-          void open.destroy().catch(() => undefined);
+        if (open) {
+          await closeConnection(open);
         }
       },
     };
@@ -562,15 +575,7 @@ export function createRuntime(config: RuntimeConfig) {
     if (!raced.done) {
       settlement.abandoned = true;
       tally(report, claimed.kind, 'settleFailed');
-      emit({
-        type: 'settle_failed',
-        jobId: claimed.id,
-        kind: claimed.kind,
-        attemptNo: claimed.attemptNo,
-        dbCode: null,
-        transient: true,
-        error: serializeError(new Error('settlement deadline exceeded; outcome left to recovery')),
-      });
+      emit(settlementExpired(claimed));
       await lane.retire();
 
       return;
@@ -611,14 +616,16 @@ export function createRuntime(config: RuntimeConfig) {
       stickyCode: claimed.stickyCode ?? null,
     };
 
-    const transition = sanitize(
-      decideTransition({
-        outcome,
-        job: budget,
-        policy: job.retry,
-        timing: { graceMs: job.graceMs },
-      }),
-    );
+    const decide = (decided: SettleOutcome) =>
+      sanitize(
+        decideTransition({
+          outcome: decided,
+          job: budget,
+          policy: job.retry,
+          timing: { graceMs: job.graceMs },
+        }),
+      );
+    const transition = decide(outcome);
 
     const commit = outcome.type === 'ok' ? outcome.commit : undefined;
     let commitError: unknown;
@@ -653,14 +660,7 @@ export function createRuntime(config: RuntimeConfig) {
 
     if (applied === 'hook_failed') {
       // The fallback settles without the hook, so a hook that always throws ends dead, not looping.
-      const fallback = sanitize(
-        decideTransition({
-          outcome: retry({ code: HOOK_FAILED_CODE }),
-          job: budget,
-          policy: job.retry,
-          timing: { graceMs: job.graceMs },
-        }),
-      );
+      const fallback = decide(retry({ code: HOOK_FAILED_CODE }));
       const result = await persist(lane, claimed, fallback, settlement, {
         hooked: false,
         requireExpiredLease: context.recovered,
@@ -711,15 +711,7 @@ export function createRuntime(config: RuntimeConfig) {
     };
 
     const deadlineFailure = () => {
-      emitWhileLive(settlement, {
-        type: 'settle_failed',
-        jobId: claimed.id,
-        kind: claimed.kind,
-        attemptNo: claimed.attemptNo,
-        dbCode: null,
-        transient: true,
-        error: serializeError(new Error('settlement deadline exceeded; outcome left to recovery')),
-      });
+      emitWhileLive(settlement, settlementExpired(claimed));
 
       return 'settle_failed' as const;
     };
@@ -855,9 +847,7 @@ export function createRuntime(config: RuntimeConfig) {
           jobId: claimed.id,
           kind: claimed.kind,
           attemptNo: claimed.attemptNo,
-          dbCode: sqlstateOf(fault),
-          transient,
-          error: serializeError(fault),
+          ...dbFault(fault),
         });
 
         return 'settle_failed';
@@ -993,7 +983,7 @@ export function createRuntime(config: RuntimeConfig) {
     const delay = Number.isFinite(delaySeconds)
       ? Math.min(MAX_QUEUE_DELAY_SECONDS, Math.max(0, Math.ceil(delaySeconds)))
       : 0;
-    const queue = Object.hasOwn(config.queues, lane) ? config.queues[lane] : undefined;
+    const queue = queueFor(lane);
 
     if (!queue) {
       emit({ type: 'nudge_skipped', ids: [...ids], lane, reason: 'no_queue' });
@@ -1035,7 +1025,7 @@ export function createRuntime(config: RuntimeConfig) {
         await stampNudges(chunk, null, via);
       } catch (error) {
         emit({ type: 'nudge_failed', ids: chunk, lane, error: serializeError(error) });
-        await stampNudges(chunk, error instanceof Error ? error.message : String(error), via);
+        await stampNudges(chunk, errorMessage(error), via);
       }
     }
   }
@@ -1046,7 +1036,7 @@ export function createRuntime(config: RuntimeConfig) {
       return;
     }
 
-    const deadlineAt = via.deadlineAt ?? clock.nowMs() + DEFAULT_PHASE_DEADLINE_MS;
+    const deadlineAt = phaseDeadline(via);
 
     const record = (runner: SqlRunner) =>
       recordNudgeResult(runner, {
@@ -1063,20 +1053,10 @@ export function createRuntime(config: RuntimeConfig) {
         // The caller owns and bounds this connection (an operator action).
         await record(via.db);
       } else {
-        await withLanes(
-          1,
-          (lane) => lane.bounded(() => record(lane.db), deadlineAt, 'nudge bookkeeping'),
-          deadlineAt,
-        );
+        await onOneLane('nudge bookkeeping', deadlineAt, record);
       }
     } catch (stampError) {
-      emit({
-        type: 'infra_error',
-        operation: 'record_nudge',
-        dbCode: sqlstateOf(stampError),
-        transient: isTransientDbError(stampError),
-        error: serializeError(stampError),
-      });
+      emit({ type: 'infra_error', operation: 'record_nudge', ...dbFault(stampError) });
     }
   }
 
@@ -1239,13 +1219,7 @@ export function createRuntime(config: RuntimeConfig) {
             await runClaimed(lane, claimed, report, trigger, claimedAtMs, deadlineAt);
           } catch (error) {
             recordError(report, error);
-            emit({
-              type: 'infra_error',
-              operation: 'run_job',
-              dbCode: sqlstateOf(error),
-              transient: isTransientDbError(error),
-              error: serializeError(error),
-            });
+            emit({ type: 'infra_error', operation: 'run_job', ...dbFault(error) });
           }
         }
       },
@@ -1257,7 +1231,7 @@ export function createRuntime(config: RuntimeConfig) {
 
   // Long kinds get a durable path through the queue (15 min budget) even when every nudge is lost.
   async function handoff(budgetMs: number, limit = 100, options: { deadlineAt?: number } = {}) {
-    const deadlineAt = options.deadlineAt ?? clock.nowMs() + DEFAULT_PHASE_DEADLINE_MS;
+    const deadlineAt = phaseDeadline(options);
     let handed = 0;
 
     for (const laneName of registry.lanes()) {
@@ -1269,22 +1243,14 @@ export function createRuntime(config: RuntimeConfig) {
         continue;
       }
 
-      const [ids = []] = await withLanes(
-        1,
-        (lane) =>
-          lane.bounded(
-            () =>
-              listDueJobIds(lane.db, {
-                kinds: long,
-                limit,
-                now: clock.dbNow(),
-                nudgeCooldownMs: HANDOFF_COOLDOWN_MS,
-                ...gate,
-              }),
-            deadlineAt,
-            'handoff',
-          ),
-        deadlineAt,
+      const ids = await onOneLane('handoff', deadlineAt, (db) =>
+        listDueJobIds(db, {
+          kinds: long,
+          limit,
+          now: clock.dbNow(),
+          nudgeCooldownMs: HANDOFF_COOLDOWN_MS,
+          ...gate,
+        }),
       );
 
       await nudgeLane(laneName, ids, 0, { deadlineAt, record: true });
@@ -1329,17 +1295,8 @@ export function createRuntime(config: RuntimeConfig) {
           }
 
           const claimed: ClaimedJob = {
-            id: lease.id,
-            kind: lease.kind,
+            ...lease,
             payload: null,
-            tenantKey: lease.tenantKey,
-            correlationId: lease.correlationId,
-            metadata: lease.metadata,
-            leaseToken: lease.leaseToken,
-            attemptNo: lease.attemptNo,
-            spentAttempts: lease.spentAttempts,
-            codeStreak: lease.codeStreak,
-            lastErrorCode: lease.lastErrorCode,
             stickyCode: lease.stickyCode ?? null,
           };
 
@@ -1370,7 +1327,7 @@ export function createRuntime(config: RuntimeConfig) {
     },
     options: { deadlineAt?: number } = {},
   ) {
-    const deadlineAt = options.deadlineAt ?? clock.nowMs() + DEFAULT_PHASE_DEADLINE_MS;
+    const deadlineAt = phaseDeadline(options);
     let deleted = 0;
 
     await withLanes(
@@ -1405,20 +1362,9 @@ export function createRuntime(config: RuntimeConfig) {
       deadlineAt?: number;
     } = {},
   ) {
-    const deadlineAt = options.deadlineAt ?? clock.nowMs() + DEFAULT_PHASE_DEADLINE_MS;
-    const [counts = []] = await withLanes(
-      1,
-      (lane) =>
-        lane.bounded(
-          () =>
-            countBacklog(lane.db, {
-              agedMs: options.agedMs ?? DEFAULT_BACKLOG_AGED_MS,
-              now: clock.dbNow(),
-            }),
-          deadlineAt,
-          'backlog',
-        ),
-      deadlineAt,
+    const deadlineAt = phaseDeadline(options);
+    const counts = await onOneLane('backlog', deadlineAt, (db) =>
+      countBacklog(db, { agedMs: options.agedMs ?? DEFAULT_BACKLOG_AGED_MS, now: clock.dbNow() }),
     );
     const report = evaluateBacklog({
       counts,
@@ -1433,28 +1379,18 @@ export function createRuntime(config: RuntimeConfig) {
   }
 
   async function hasBacklog(scope: Scope = {}, options: { deadlineAt?: number } = {}) {
-    const deadlineAt = options.deadlineAt ?? clock.nowMs() + DEFAULT_PHASE_DEADLINE_MS;
-    const [due] = await withLanes(
-      1,
-      (lane) =>
-        lane.bounded(
-          () =>
-            hasDueJobs(lane.db, {
-              ...gate,
-              kinds: kindFilter(Number.POSITIVE_INFINITY, scope),
-              now: clock.dbNow(),
-            }),
-          deadlineAt,
-          'backlog check',
-        ),
-      deadlineAt,
+    const deadlineAt = phaseDeadline(options);
+    return onOneLane('backlog check', deadlineAt, (db) =>
+      hasDueJobs(db, {
+        ...gate,
+        kinds: kindFilter(Number.POSITIVE_INFINITY, scope),
+        now: clock.dbNow(),
+      }),
     );
-
-    return due ?? false;
   }
 
   async function continueDrain(lane = 'default', options: { deadlineAt?: number } = {}) {
-    const queue = Object.hasOwn(config.queues, lane) ? config.queues[lane] : undefined;
+    const queue = queueFor(lane);
 
     if (!queue) {
       emit({ type: 'continuation_skipped', lane, reason: 'no_queue' });
