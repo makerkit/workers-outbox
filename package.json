@@ -4,7 +4,7 @@
   "description": "Transactional outbox for Postgres on Cloudflare Workers (Hyperdrive + Queues + Cron Triggers).",
   "license": "MIT",
   "type": "module",
-  "private": "false",
+  "private": false,
   "publishConfig": {
     "access": "public"
   },
