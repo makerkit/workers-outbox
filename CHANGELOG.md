@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.2 — 2026-11-14
+
+### Features
+
+- `listJobs` supports `order: 'desc'` for newest-first keyset pagination. The default remains oldest first; ties use the job ID in the same direction.
+- `listJobs` and `countJobs` accept an omitted `status` to inspect all statuses, and `createdAtOrAfter` for inclusive creation-date bounds. Existing exclusive date filters retain their behavior.
+- `countBacklog` returns separate `pending` and `retrying` counts per kind, including scheduled jobs, alongside its existing backlog metrics.
+
 ## 0.0.1 — 2026-11-05
 
 Initial release of `@makerkit/workers-outbox`: a transactional outbox for Postgres on Cloudflare Workers (Hyperdrive + Queues + Cron Triggers).

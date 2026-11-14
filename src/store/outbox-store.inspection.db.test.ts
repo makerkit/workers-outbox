@@ -141,6 +141,102 @@ describe.each(testDrivers())('outbox store inspection on $name', ({ create }) =>
     });
   });
 
+  describe('dashboard inspection', () => {
+    it('lists and counts all statuses while retaining tenant and kind filters', async () => {
+      const deadId = await settleAs(dead(), at(0), { tenantKey: 'org-1' });
+      const succeededId = await settleAs(succeeded, at(1), { tenantKey: 'org-1' });
+      const pending = await enqueue({ tenantKey: 'org-1' }, at(2));
+      await enqueue({ tenantKey: 'org-2' }, at(3));
+      await enqueue({ kind: CRM.kind, tenantKey: 'org-1' }, at(4));
+      await enqueue({}, at(5));
+
+      const filter = { tenantKey: 'org-1', kind: EMAIL.kind };
+      const page = await listJobs(driver.db, { ...filter, limit: 10 });
+
+      expect(page.jobs.map((job) => job.id)).toEqual([deadId, succeededId, pending.id]);
+      expect(await countJobs(driver.db, filter)).toBe(3);
+      expect(await countJobs(driver.db, { ...filter, status: 'dead' })).toBe(1);
+      expect(await countJobs(driver.db, { tenantKey: null })).toBe(1);
+      expect(await countJobs(driver.db, {})).toBe(6);
+    });
+
+    it('includes midnight with createdAtOrAfter and preserves exclusive date bounds', async () => {
+      await enqueue({}, at(-1));
+      const midnight = await enqueue({}, T0);
+      const later = await enqueue({}, at(1));
+      await enqueue({}, at(2));
+
+      const filter = { createdAtOrAfter: T0, createdBefore: at(2) };
+      const page = await listJobs(driver.db, { ...filter, limit: 10 });
+
+      expect(page.jobs.map((job) => job.id)).toEqual([midnight.id, later.id]);
+      expect(await countJobs(driver.db, filter)).toBe(2);
+      expect(await countJobs(driver.db, { ...filter, createdAfter: T0 })).toBe(1);
+    });
+
+    it.each(['asc', 'desc'] as const)(
+      'pages tied timestamps in %s order across all statuses',
+      async (order) => {
+        const deadId = await settleAs(dead(), T0);
+        const succeededId = await settleAs(succeeded, T0);
+        const pending = await enqueue({}, T0);
+        const later = await enqueue({}, at(1));
+        const expected = [deadId, succeededId, pending.id].sort();
+        expected.push(later.id);
+
+        if (order === 'desc') {
+          expected.reverse();
+        }
+
+        const ids: string[] = [];
+        let cursor: string | null = null;
+
+        for (let pageNumber = 0; pageNumber < expected.length; pageNumber++) {
+          const page = await listJobs(driver.db, { order, limit: 1, cursor });
+          ids.push(...page.jobs.map((job) => job.id));
+          cursor = page.nextCursor;
+
+          if (cursor === null) {
+            break;
+          }
+        }
+
+        expect(ids).toEqual(expected);
+        expect(cursor).toBeNull();
+        expect(await listJobs(driver.db, { order, limit: 0 })).toEqual({
+          jobs: [],
+          nextCursor: null,
+        });
+      },
+    );
+
+    it('counts pending and retrying separately, including scheduled jobs', async () => {
+      await settleAs(retrying(60_000), T0, { tenantKey: 'org-1' });
+      await enqueue({ tenantKey: 'org-1' });
+      await enqueue({ tenantKey: 'org-1', delayMs: 120_000 });
+      await enqueue({ tenantKey: 'org-2' });
+      await enqueue({ kind: CRM.kind, tenantKey: 'org-1' });
+
+      expect(
+        await countBacklog(driver.db, {
+          agedMs: 1_000,
+          now: T0,
+          tenantKey: 'org-1',
+          kinds: [EMAIL.kind],
+        }),
+      ).toEqual([
+        expect.objectContaining({
+          kind: EMAIL.kind,
+          pending: 2,
+          retrying: 1,
+          due: 1,
+          scheduled: 2,
+          processing: 0,
+        }),
+      ]);
+    });
+  });
+
   describe('aggregateAttemptOutcomes', () => {
     const HOUR = 3_600_000;
 
@@ -251,6 +347,8 @@ describe.each(testDrivers())('outbox store inspection on $name', ({ create }) =>
       expect(await countBacklog(driver.db, { agedMs: AGED, now })).toEqual([
         {
           kind: CRM.kind,
+          pending: 0,
+          retrying: 0,
           due: 0,
           aged: 0,
           scheduled: 0,
@@ -260,6 +358,8 @@ describe.each(testDrivers())('outbox store inspection on $name', ({ create }) =>
         },
         {
           kind: EMAIL.kind,
+          pending: 2,
+          retrying: 0,
           due: 1,
           aged: 1,
           scheduled: 1,
