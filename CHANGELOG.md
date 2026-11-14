@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.3 — 2026-11-14
+
+### Fixes
+
+- Build before packing or publishing so the package includes the inspection APIs added in 0.0.2. The published 0.0.2 tarball contained stale build output.
+
 ## 0.0.2 — 2026-11-14
 
 ### Features
