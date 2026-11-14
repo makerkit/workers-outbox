@@ -976,6 +976,22 @@ const job = await getJob(db, { id: jobId, tenantKey: user.orgId }); // null when
 const dead = await listJobs(db, { status: 'dead', limit: 50, statementTimeoutMs: 5_000 });
 ```
 
+`listJobs` defaults to oldest first. Set `order: 'desc'` for newest first; both creation time and job ID use that direction. Pass `nextCursor` back as `cursor` with the same filters and order. Drop the cursor when either changes.
+
+Omit `status` in `listJobs` or `countJobs` to include all statuses. Tenant scoping is independent: continue passing `tenantKey` for tenant dashboards. `createdAtOrAfter` includes its boundary; `createdAfter`, `createdBefore`, `finishedAfter` and `finishedBefore` remain exclusive.
+
+```ts
+const latest = await listJobs(db, {
+  tenantKey: user.orgId,
+  createdAtOrAfter: new Date('2026-11-01T00:00:00.000Z'),
+  createdBefore: new Date('2026-12-01T00:00:00.000Z'),
+  order: 'desc',
+  limit: 50,
+});
+```
+
+`countBacklog` includes `pending` and `retrying` counts for each kind. These count all jobs in those statuses, including future jobs. `due`, `aged`, `scheduled`, `processing`, `stuck` and backlog severity retain their existing meanings.
+
 ## Best practices
 
 **Enqueueing**

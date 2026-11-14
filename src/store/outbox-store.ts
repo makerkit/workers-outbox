@@ -572,7 +572,7 @@ export async function listDueJobIds(
 export async function countBacklog(
   db: SqlRunner,
   input: { agedMs: number; now: Date | null; kinds?: readonly string[]; tenantKey?: TenantScope },
-): Promise<KindBacklog[]> {
+): Promise<(KindBacklog & { pending: number; retrying: number })[]> {
   if (input.kinds?.length === 0) {
     return [];
   }
@@ -581,6 +581,8 @@ export async function countBacklog(
 
   const rows = await queryRows<{
     kind: string;
+    pending: number;
+    retrying: number;
     due: number;
     aged: number;
     scheduled: number;
@@ -597,6 +599,8 @@ export async function countBacklog(
           WHERE j.status IN ('pending', 'retrying', 'processing')${kindClause}${tenantClause(sql`j.tenant_key`, input.tenantKey)}
         )
         SELECT kind,
+          count(*) FILTER (WHERE status = 'pending')::int AS pending,
+          count(*) FILTER (WHERE status = 'retrying')::int AS retrying,
           count(*) FILTER (WHERE due_at <= (SELECT t FROM clock))::int AS due,
           count(*) FILTER (WHERE due_at < (SELECT t FROM clock) - ${ms(input.agedMs)})::int AS aged,
           count(*) FILTER (WHERE due_at > (SELECT t FROM clock))::int AS scheduled,
@@ -610,6 +614,8 @@ export async function countBacklog(
 
   return rows.map((row) => ({
     kind: row.kind,
+    pending: row.pending,
+    retrying: row.retrying,
     due: row.due,
     aged: row.aged,
     scheduled: row.scheduled,
@@ -647,12 +653,13 @@ export interface JobSummary {
 }
 
 export interface JobFilter {
-  status: JobStatus;
+  status?: JobStatus;
   kind?: string;
   tenantKey?: TenantScope;
   dedupeKey?: string;
   terminalReason?: string;
   createdAfter?: Date;
+  createdAtOrAfter?: Date;
   createdBefore?: Date;
   finishedAfter?: Date;
   finishedBefore?: Date;
@@ -661,8 +668,18 @@ export interface JobFilter {
 const optional = <T>(value: T | undefined, clause: (value: T) => SQL) =>
   value === undefined ? sql`` : clause(value);
 
-const jobFilter = (filter: JobFilter) =>
-  sql`j.status = ${filter.status}${optional(filter.kind, (v) => sql` AND j.kind = ${v}`)}${tenantClause(sql`j.tenant_key`, filter.tenantKey)}${optional(filter.dedupeKey, (v) => sql` AND j.dedupe_key = ${v}`)}${optional(filter.terminalReason, (v) => sql` AND j.terminal_reason = ${v}`)}${optional(filter.createdAfter, (v) => sql` AND j.created_at > ${v.toISOString()}::timestamptz`)}${optional(filter.createdBefore, (v) => sql` AND j.created_at < ${v.toISOString()}::timestamptz`)}${optional(filter.finishedAfter, (v) => sql` AND j.finished_at > ${v.toISOString()}::timestamptz`)}${optional(filter.finishedBefore, (v) => sql` AND j.finished_at < ${v.toISOString()}::timestamptz`)}`;
+const jobFilter = (filter: JobFilter) => sql`TRUE
+  ${optional(filter.status, (value) => sql` AND j.status = ${value}`)}
+  ${optional(filter.kind, (value) => sql` AND j.kind = ${value}`)}
+  ${tenantClause(sql`j.tenant_key`, filter.tenantKey)}
+  ${optional(filter.dedupeKey, (value) => sql` AND j.dedupe_key = ${value}`)}
+  ${optional(filter.terminalReason, (value) => sql` AND j.terminal_reason = ${value}`)}
+  ${optional(filter.createdAtOrAfter, (value) => sql` AND j.created_at >= ${value.toISOString()}::timestamptz`)}
+  ${optional(filter.createdAfter, (value) => sql` AND j.created_at > ${value.toISOString()}::timestamptz`)}
+  ${optional(filter.createdBefore, (value) => sql` AND j.created_at < ${value.toISOString()}::timestamptz`)}
+  ${optional(filter.finishedAfter, (value) => sql` AND j.finished_at > ${value.toISOString()}::timestamptz`)}
+  ${optional(filter.finishedBefore, (value) => sql` AND j.finished_at < ${value.toISOString()}::timestamptz`)}
+`;
 
 const jobSummaryColumns = sql`j.id, j.kind, j.status, j.dedupe_key, j.tenant_key, j.correlation_id, j.metadata,
   j.started_attempts, j.finished_attempts, j.spent_attempts, j.code_streak, j.sticky_code,
@@ -672,14 +689,17 @@ const jobSummaryColumns = sql`j.id, j.kind, j.status, j.dedupe_key, j.tenant_key
   ${epochMs(sql`j.updated_at`)} AS updated_at, ${epochMs(sql`j.finished_at`)} AS finished_at,
   ${epochMs(sql`j.nudge_sent_at`)} AS nudge_sent_at, now() AS read_at`;
 
-/** Keyset-paginated: pass `nextCursor` back as `cursor`. */
+/** Keyset-paginated, oldest first by default. Reuse cursors with the same filters and order. */
 export async function listJobs(
   db: SqlRunner,
-  input: JobFilter & { limit: number; cursor?: string | null },
+  input: JobFilter & { limit: number; cursor?: string | null; order?: 'asc' | 'desc' },
 ) {
   const after = input.cursor ? parseCursor(input.cursor) : null;
+  const descending = input.order === 'desc';
+  const comparison = descending ? sql`<` : sql`>`;
+  const direction = descending ? sql`DESC` : sql`ASC`;
   const afterClause = after
-    ? sql` AND (j.created_at, j.id) > (${after.createdAt}::timestamptz, ${after.id}::uuid)`
+    ? sql` AND (j.created_at, j.id) ${comparison} (${after.createdAt}::timestamptz, ${after.id}::uuid)`
     : sql``;
 
   const rows = await queryRows<JobSummaryRow>(
@@ -687,7 +707,7 @@ export async function listJobs(
     sql`SELECT ${jobSummaryColumns}
         FROM "outbox"."job" j
         WHERE ${jobFilter(input)}${afterClause}
-        ORDER BY j.created_at, j.id
+        ORDER BY j.created_at ${direction}, j.id ${direction}
         LIMIT ${Math.max(0, input.limit) + 1}`,
   );
 
