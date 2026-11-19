@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.0.4 — 2026-11-18
+
+### Fixes
+
+- `outbox.transaction()` protects its node-postgres checkout from `BEGIN` through release, including with Drizzle replica routing and decorated transactions. A client read timeout during `BEGIN` or a server-side idle transaction timeout discards the failed connection so the next producer can commit on the same pool. A bound transaction decorator uses a single checkout.
+- If PostgreSQL rolls back an aborted producer transaction at commit, the helper rejects and sends no queue nudge. An error recovered inside a savepoint still permits the outer transaction to commit.
+- Settlement retries `ok({ commit })` on a fresh PostgreSQL session after a client query timeout, preventing a later job from committing the first attempt’s unfinished writes.
+- During a gradual rollout, expired-lease recovery honors the same deployment version gate as job claims. An older worker can no longer dead-letter a newer deployment’s job under its own retry policy while the gate is active.
+- Scheduled cleanup applies retention only to registered job kinds. Workers sharing an outbox schema keep their own deduplication records for their configured retention period.
+- Cron uses the remaining sweep time to decide which jobs need queue handoff. When some lanes rely on cron alone, it runs explicit reservations first, then hands off queue-backed work before the general sweep.
+- A ten-minute job can start at the minimum 635-second queue budget after connection checkout, provided enough time remains for the handler, its grace period, and settlement.
+- Cloudflare Workers now count synchronous validation and handler execution toward `timeoutMs`. Two database round trips on a successful attempt refresh the clock before the handler starts and before its result is accepted. Both count toward the timeout. If the handler discarded its connection, the final check can use a fresh session and preserve the handler’s retry and backoff.
+
 ## 0.0.3 — 2026-11-14
 
 ### Fixes

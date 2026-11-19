@@ -8,7 +8,7 @@ import type { HandlerOutcome } from '../core/outcome';
 import type { TestClock } from '../testing/test-clock';
 
 import { DEFAULT_INVOCATION_BUDGET_MS } from '../cloudflare/limits';
-import { createScheduledHandler } from '../cloudflare/scheduled-handler';
+import { createScheduledHandler, HANDOFF_RESERVE_MS } from '../cloudflare/scheduled-handler';
 import { defineJob } from '../core/define-job';
 import { ok } from '../core/outcome';
 import { getJob } from '../store/outbox-store';
@@ -120,7 +120,10 @@ describe.each(testDrivers())('pre-production audit regressions: $name', ({ creat
             // Runs right up to the schedules' deadline, as a callback bounded by it can.
             run: async () => {
               schedulesDeadline =
-                startedAt + DEFAULT_INVOCATION_BUDGET_MS - DEFAULT_RECOVERY_BUDGET_MS;
+                startedAt +
+                DEFAULT_INVOCATION_BUDGET_MS -
+                HANDOFF_RESERVE_MS -
+                DEFAULT_RECOVERY_BUDGET_MS;
               clock.advance(schedulesDeadline - clock.nowMs() - 1);
             },
           },
@@ -170,10 +173,10 @@ describe.each(testDrivers())('pre-production audit regressions: $name', ({ creat
 
       await tick({ cron, scheduledTime: clock.nowMs() }, {}, {});
 
-      // The 13th starts at 708 s, before the 720 s cutoff, and overruns it; the rest find the
-      // cutoff passed and fail. Without the reserve all 15 run and recovery has no time left.
-      expect(events.of('schedule_ran')).toHaveLength(13);
-      expect(events.of('schedule_failed')).toHaveLength(2);
+      // With separate 120 s recovery and 30 s handoff reserves, the cutoff is 690 s. The
+      // 12th callback starts before it and overruns it; the remaining three are refused.
+      expect(events.of('schedule_ran')).toHaveLength(12);
+      expect(events.of('schedule_failed')).toHaveLength(3);
       expect(events.of('sweep_finished').at(-1)?.recovered).toBe(1);
       expect((await getJob(driver.db, { id }))?.status).toBe('succeeded');
     });

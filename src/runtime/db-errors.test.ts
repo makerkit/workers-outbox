@@ -29,6 +29,7 @@ describe('database error classification', () => {
     ['an SQLSTATE connection exception', Object.assign(new Error('x'), { code: '08006' })],
     ['an admin shutdown', Object.assign(new Error('x'), { code: '57P01' })],
     ['node-pg termination', new Error('Connection terminated unexpectedly')],
+    ['node-pg client read timeout', new Error('Query read timeout')],
     [
       'node-pg refusing a dead client',
       new Error('Client has encountered a connection error and is not queryable'),

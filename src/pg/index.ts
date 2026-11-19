@@ -3,6 +3,8 @@ import { Client, type ClientConfig, type Pool, type PoolClient } from 'pg';
 
 import type { LaneConnection, OutboxDb } from '../runtime/types';
 
+import { guardPgClient } from './guard-client';
+
 export interface PgConnectorOptions {
   /**
    * Errors a session raises outside a query, e.g. the FATAL `transaction_timeout` sends when it
@@ -53,7 +55,15 @@ export function createPgConnector(
 
     const end = once(() => client.end());
 
-    return { db: drizzleOf(client), close: end, destroy: end, isBroken: () => broken };
+    return {
+      db: drizzleOf(client, async () => {
+        broken = true;
+        await end();
+      }),
+      close: end,
+      destroy: end,
+      isBroken: () => broken,
+    };
   };
 }
 
@@ -63,7 +73,8 @@ export function createPgConnector(
  * still holds a pool slot. Also attach `pool.on('error', …)`: node-pg re-emits a returned
  * client's late errors (a FATAL after release) on the pool, which crashes the process unlistened.
  * `close()` returns the client; `destroy()` discards it
- * (`release(true)`), so a session abandoned mid-query is never reused.
+ * (`release(true)`), so a session abandoned mid-query is never reused. A `query_timeout`
+ * invalidates and discards the session immediately, even if a callback catches the error.
  */
 export function createPgPoolConnector(
   pool: Pool,
@@ -88,18 +99,29 @@ export function createPgPoolConnector(
     let ended: Promise<void> | undefined;
     const close = release(false);
     const destroy = release(true);
+    const discard = () => (ended ??= destroy());
 
     return {
-      db: drizzleOf(client),
+      db: drizzleOf(client, async () => {
+        broken = true;
+        await discard();
+      }),
       // A dead session must not go back to the pool.
       close: () => (ended ??= broken ? destroy() : close()),
-      destroy: () => (ended ??= destroy()),
+      destroy: discard,
       isBroken: () => broken,
     };
   };
 }
 
-const drizzleOf = (client: Client | PoolClient) => drizzle({ client }) as unknown as OutboxDb;
+/**
+ * Observe Drizzle's promise-form driver queries, including transaction control and query
+ * builders. A client read timeout may be caught by user code; discard the session before
+ * that code can continue or Drizzle can COMMIT. The caller's pooled client is not modified.
+ */
+function drizzleOf(client: Client | PoolClient, discard: () => Promise<void>): OutboxDb {
+  return drizzle({ client: guardPgClient(client, discard) }) as unknown as OutboxDb;
+}
 
 function once(fn: () => Promise<void>): () => Promise<void> {
   let done: Promise<void> | undefined;

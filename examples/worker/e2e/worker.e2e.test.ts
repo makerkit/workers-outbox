@@ -108,6 +108,7 @@ function writeE2eConfig() {
   const config = JSON.parse(json) as Record<string, unknown>;
   const lib = '@makerkit/workers-outbox';
 
+  config['main'] = 'e2e/fixture.ts';
   config['alias'] = {
     [lib]: join(ROOT, 'src/index.ts'),
     ...Object.fromEntries(
@@ -313,6 +314,22 @@ describe.skipIf(!wrangler)('example Worker under wrangler dev', () => {
       .filter((event) => event.jobId === jobId);
 
   const fail = (what: string) => `${what}\n--- wrangler dev output ---\n${output.join('')}`;
+
+  it('persists the handler’s retry and backoff after a client read timeout closes its lane', async () => {
+    // Cross the default five-crash limit. Advance only the persisted backoff between attempts.
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      const response = await fetch(base + '/test/read-timeout', { method: 'POST' });
+      expect(response.status, fail('timeout probe')).toBe(204);
+      const row = await job('e2e.read-timeout');
+      expect(row).toMatchObject({ status: 'retrying', last_error_code: 'database_busy' });
+      expect(row!.attempts).toEqual(
+        Array(attempt).fill({ outcome: 'retry', code: 'database_busy', trigger: 'sweep' }),
+      );
+      expect(row!.due_in_ms).toBeGreaterThan(110_000);
+      expect(row!.due_in_ms).toBeLessThanOrEqual(120_000);
+      if (attempt < 6) await makeDue(row!.id);
+    }
+  });
 
   describe('enqueue', () => {
     it('signup commits the user and its job; the queue runs it once', async () => {

@@ -1,4 +1,4 @@
-// Matched on codes only, never on message text (except node-pg's code-less termination).
+// Matched on codes, except node-pg's code-less termination and client read timeout errors.
 // Class 53 (insufficient resources) is retryable as a whole.
 const TRANSIENT_SQLSTATES = new Set(['40001', '40003', '40P01', '55P03', '57014']);
 
@@ -26,6 +26,10 @@ const SOCKET_CODES = new Set([
 ]);
 
 const NODE_PG_TERMINATED = /^Connection terminated/;
+
+// pg's client timer does not cancel the server query. A queued ROLLBACK can also time out
+// before it is sent, leaving an open transaction: this session must never be reused.
+const NODE_PG_READ_TIMEOUT = /^Query read timeout$/;
 
 // node-pg refuses a query on a client whose socket already died (e.g. while a handler ran):
 // a bare Error, no code. The query never left the client, so a fresh lane can retry it.
@@ -81,7 +85,10 @@ export function isConnectionError(error: unknown) {
   const hit = findInChain(error, (node) => {
     const code = typeof node.code === 'string' ? node.code : '';
     const message = typeof node.message === 'string' ? node.message : '';
-    const terminated = NODE_PG_TERMINATED.test(message) || NODE_PG_NOT_QUERYABLE.test(message);
+    const terminated =
+      NODE_PG_TERMINATED.test(message) ||
+      NODE_PG_NOT_QUERYABLE.test(message) ||
+      NODE_PG_READ_TIMEOUT.test(message);
 
     return code.startsWith('08') ||
       CONNECTION_SQLSTATES.has(code) ||

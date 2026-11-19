@@ -1,6 +1,6 @@
 {
   "name": "@makerkit/workers-outbox",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Transactional outbox for Postgres on Cloudflare Workers (Hyperdrive + Queues + Cron Triggers).",
   "license": "MIT",
   "type": "module",
@@ -89,7 +89,7 @@
     "vitest": "^5.1.0",
     "zod": "^4.6.7"
   },
-  "packageManager": "pnpm@12.16.1",
+  "packageManager": "pnpm@12.18.0",
   "dependencies": {
     "@standard-schema/spec": "^1.1.0",
     "uuid": "^14.0.3"

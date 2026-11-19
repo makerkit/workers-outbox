@@ -24,7 +24,8 @@ export interface ScheduledHandlerOptions {
   /**
    * Recovery's share of the tick, so a crash backlog can't starve fresh work. Default 120 s.
    * What doesn't fit stays expired for the next tick. Counted from when recovery starts, and held
-   * back from `schedules` (up to half the invocation), so schedules can't consume it.
+   * back from `schedules` (up to half the work window), so schedules can't consume it. Handoff
+   * keeps the final 30 s separately (at most a quarter of a small invocation).
    */
   recoveryBudgetMs?: number;
   /** Drained before the catch-all so other kinds can't starve these; keep each ≤ 45 s. */
@@ -45,6 +46,10 @@ export interface ScheduledHandlerOptions {
 }
 
 export const DEFAULT_SWEEP_BUDGET: Budget = { maxJobs: 50, deadlineMs: 180_000 };
+
+// Claims, recovery and schedules stop early enough to hand jobs to a fresh queue invocation.
+// Small invocations keep at least three quarters of their time for those phases.
+export const HANDOFF_RESERVE_MS = 30_000;
 
 export interface ScheduledEventLike {
   readonly cron?: string;
@@ -80,8 +85,12 @@ export function createScheduledHandler<Env, Ctx = unknown>(
     );
   }
 
-  // Never more than half the tick: schedules keep a window even under a small invocation budget.
-  const recoveryReserveMs = Math.min(recoveryBudgetMs, Math.floor(invocationBudgetMs / 2));
+  const handoffReserveMs = Math.min(HANDOFF_RESERVE_MS, Math.floor(invocationBudgetMs / 4));
+  // Recovery keeps its share of the work window; handoff has a separate reserve after it.
+  const recoveryReserveMs = Math.min(
+    recoveryBudgetMs,
+    Math.floor((invocationBudgetMs - handoffReserveMs) / 2),
+  );
 
   const retention = {
     succeededRetentionMs: options.retention?.succeededRetentionMs ?? DEFAULT_SUCCEEDED_RETENTION_MS,
@@ -112,6 +121,10 @@ export function createScheduledHandler<Env, Ctx = unknown>(
     const startedAt = runtime.nowMs();
     const deadlineAt = startedAt + invocationBudgetMs;
     const within = { deadlineAt };
+    const workDeadlineAt = deadlineAt - handoffReserveMs;
+    // A queue-less lane must be able to spend the final slice on its own job. In
+    // mixed registries dispatch due queue-backed jobs before the catch-all drain.
+    const drainWithin = runtime.hasCronOnlyLanes ? within : { deadlineAt: workDeadlineAt };
 
     if (schedules.length > 0) {
       // Never throws: each schedule reports its own failure, and the sweep runs regardless.
@@ -121,25 +134,39 @@ export function createScheduledHandler<Env, Ctx = unknown>(
         schedules,
         cron,
         event.scheduledTime ?? startedAt,
-        deadlineAt - recoveryReserveMs,
+        workDeadlineAt - recoveryReserveMs,
       );
     }
 
     // Measured from when recovery starts, not the tick: schedule time is not recovery's.
     const recovery = await phase('recover', () =>
       runtime.recover(recoveryLimit, {
-        deadlineAt: Math.min(deadlineAt, runtime.nowMs() + recoveryBudgetMs),
+        deadlineAt: Math.min(workDeadlineAt, runtime.nowMs() + recoveryBudgetMs),
       }),
     );
 
     for (const slice of options.reserved ?? []) {
       await phase('reserved', () =>
-        runtime.drain(slice.budget, 'sweep', { kinds: slice.kinds }, within),
+        runtime.drain(slice.budget, 'sweep', { kinds: slice.kinds }, drainWithin),
       );
     }
 
-    const report = await phase('drain', () => runtime.drain(budget, 'sweep', {}, within));
-    await phase('handoff', () => runtime.handoff(budget.deadlineMs, 100, within));
+    if (runtime.hasCronOnlyLanes) {
+      await phase('handoff', () =>
+        runtime.handoff(0, 100, {
+          deadlineAt: Math.min(deadlineAt, runtime.nowMs() + handoffReserveMs),
+        }),
+      );
+    }
+
+    const sweepDeadlineAt = Math.min(drainWithin.deadlineAt, runtime.nowMs() + budget.deadlineMs);
+    const report = await phase('drain', () => runtime.drain(budget, 'sweep', {}, drainWithin));
+    // Include jobs that fit the nominal sweep but cannot fit what earlier phases left.
+    // This also covers a sweep that claimed nothing, and one that spent its entire window.
+    const remainingSweepMs = Math.max(0, sweepDeadlineAt - runtime.nowMs());
+    if (!runtime.hasCronOnlyLanes) {
+      await phase('handoff', () => runtime.handoff(remainingSweepMs, 100, within));
+    }
     const deleted = await phase('cleanup', () => runtime.cleanup(retention, within));
 
     let continued = false;

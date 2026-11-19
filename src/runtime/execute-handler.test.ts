@@ -1,6 +1,6 @@
 import type { StandardSchemaV1 } from '@standard-schema/spec';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
 import type { ClaimedJob } from '../store/outbox-store';
@@ -148,6 +148,61 @@ describe('executeHandler: the timeout starts with the attempt', () => {
     },
   });
 
+  it.each(['system', 'frozen'] as const)(
+    'never starts a handler after synchronous validation consumes the timeout (%s clock)',
+    async (mode) => {
+      let calls = 0;
+      const job = defineJob({
+        kind: 'steps',
+        payload: slowSchema(80),
+        timeoutMs: 20,
+        handle: async () => {
+          calls++;
+          return ok();
+        },
+      });
+      const result = await executeHandler({
+        job,
+        claimed,
+        db: fakeDb,
+        deps: {},
+        clock: mode === 'system' ? systemClock : createTestClock(),
+      });
+      expect(calls).toBe(0);
+      expect(result).toEqual({ outcome: { type: 'timeout' }, runaway: false });
+    },
+  );
+
+  it.each(['return', 'throw'] as const)(
+    'discards a handler that blocks past its timeout before it can %s',
+    async (action) => {
+      let signal: AbortSignal | undefined;
+      const job = defineJob({
+        kind: 'steps',
+        payload: z.number(),
+        timeoutMs: 20,
+        handle: async (_, ctx) => {
+          signal = ctx.signal;
+          const until = Date.now() + 80;
+          while (Date.now() < until) {
+            /* synchronous work */
+          }
+          if (action === 'throw') throw new Error('late error');
+          return ok();
+        },
+      });
+      const result = await executeHandler({
+        job,
+        claimed,
+        db: fakeDb,
+        deps: {},
+        clock: createTestClock(),
+      });
+      expect(result).toEqual({ outcome: { type: 'timeout' }, runaway: false });
+      expect(signal?.aborted).toBe(true);
+    },
+  );
+
   it('counts synchronous payload validation against timeoutMs and ctx.deadline', async () => {
     const startedAt = Date.now();
     let deadline = 0;
@@ -175,4 +230,95 @@ describe('executeHandler: the timeout starts with the attempt', () => {
     expect(result.outcome).toEqual({ type: 'timeout' });
     expect(deadline - startedAt).toBeLessThanOrEqual(300 + 20);
   });
+});
+
+describe('Workers clocks advance at I/O boundaries', () => {
+  it('rejects a late result when the first post-handler clock read hits a discarded session', async () => {
+    let closed = false;
+    let visible = 0;
+    const db: OutboxDb = {
+      execute: async () => {
+        if (closed) throw new Error('Query read timeout');
+        return [];
+      },
+      transaction: (fn) => fn(db),
+    };
+    const fresh: OutboxDb = {
+      execute: async () => {
+        visible = 1_100;
+        return [];
+      },
+      transaction: (fn) => fn(fresh),
+    };
+    const replaceDb = vi.fn(async () => fresh);
+    vi.stubGlobal('WebSocketPair', () => ({}));
+    vi.spyOn(performance, 'now').mockImplementation(() => visible);
+    try {
+      const job = defineJob({
+        kind: claimed.kind,
+        timeoutMs: 1_000,
+        payload: z.number(),
+        handle: async () => {
+          closed = true;
+          return ok();
+        },
+      });
+      const result = await executeHandler({
+        job,
+        claimed,
+        db,
+        replaceDb,
+        deps: {},
+        clock: systemClock,
+      });
+      expect(result.outcome.type).toBe('timeout');
+      expect(replaceDb).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it.each(['validation', 'return', 'throw', 'in time'] as const)(
+    'observes the deadline after %s',
+    async (phase) => {
+      // Model two clocks: time spent in application code and the reading the
+      // platform exposes. A completed database operation refreshes the latter.
+      let elapsed = 0;
+      let visible = 0;
+      let calls = 0;
+      const db: OutboxDb = {
+        execute: async () => {
+          visible = elapsed;
+          return [];
+        },
+        transaction: (fn) => fn(db),
+      };
+      vi.stubGlobal('WebSocketPair', () => ({}));
+      vi.spyOn(performance, 'now').mockImplementation(() => visible);
+      vi.spyOn(Date, 'now').mockImplementation(() => visible);
+      try {
+        const job = defineJob({
+          kind: claimed.kind,
+          timeoutMs: 1_000,
+          payload: z.number().transform((value) => {
+            if (phase === 'validation') elapsed += 1_100;
+            return value;
+          }),
+          handle: async () => {
+            calls++;
+            if (phase !== 'in time') elapsed += 1_100;
+            if (phase === 'throw') throw new Error('late error');
+            return ok();
+          },
+        });
+        const result = await executeHandler({ job, claimed, db, deps: {}, clock: systemClock });
+        expect(result.outcome.type).toBe(phase === 'in time' ? 'ok' : 'timeout');
+        expect(calls).toBe(phase === 'validation' ? 0 : 1);
+      } finally {
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+      }
+    },
+  );
 });

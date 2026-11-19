@@ -396,6 +396,7 @@ export async function listExpiredLeases(
     limit: number;
     now: Date | null;
     kinds?: readonly string[];
+    version?: VersionGate;
   },
 ) {
   if (input.kinds?.length === 0 || input.limit < 1) {
@@ -418,10 +419,11 @@ export async function listExpiredLeases(
     started_attempts: number;
   }>(
     db,
-    sql`SELECT id, kind, lease_token, spent_attempts, code_streak, last_error_code, sticky_code,
+    sql`WITH clock AS (SELECT ${dbNow(input.now)} AS t)
+        SELECT id, kind, lease_token, spent_attempts, code_streak, last_error_code, sticky_code,
                tenant_key, correlation_id, metadata, started_attempts
-        FROM "outbox"."job"
-        WHERE status = 'processing' AND leased_until < ${dbNow(input.now)}${kindClause}
+        FROM "outbox"."job" j
+        WHERE status = 'processing' AND leased_until < (SELECT t FROM clock)${kindClause}${versionClause(sql`j`, input.version)}
         ORDER BY leased_until
         LIMIT ${input.limit}`,
   );
@@ -496,11 +498,13 @@ export async function deleteFinishedJobs(
     succeededRetentionMs: number;
     terminalRetentionMs: number;
     batch: number;
+    kinds?: readonly string[];
     now: Date | null;
   },
 ) {
+  const kindClause = input.kinds ? sql` AND kind = ANY(${textArray(input.kinds)})` : sql``;
   const expired = sql`((status = 'succeeded' AND finished_at < (SELECT t FROM clock) - ${ms(input.succeededRetentionMs)})
-             OR (status IN ('dead', 'cancelled') AND finished_at < (SELECT t FROM clock) - ${ms(input.terminalRetentionMs)}))`;
+             OR (status IN ('dead', 'cancelled') AND finished_at < (SELECT t FROM clock) - ${ms(input.terminalRetentionMs)}))${kindClause}`;
   const rows = await queryRows<{ deleted: number }>(
     db,
     // The predicate is repeated on the DELETE: under READ COMMITTED a row replayed while the

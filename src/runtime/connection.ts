@@ -1,5 +1,6 @@
 import type { Clock, LaneConnection } from './types';
 
+import { isConnectionError } from './db-errors';
 import { settledWithin, unwrap, untilDeadline } from './deadline';
 
 // Destroying may wait on a runaway query; past this the session is abandoned (unusable either way).
@@ -37,7 +38,11 @@ export const destroyConnection = (connection: LaneConnection) =>
   settledWithin(connection.destroy(), DESTROY_WAIT_MS);
 
 /** Returns a healthy session; one whose `close()` hangs is destroyed instead. */
-export async function closeConnection(connection: LaneConnection) {
+export async function closeConnection(connection: LaneConnection, error?: unknown) {
+  if (connection.isBroken?.() || isConnectionError(error)) {
+    await destroyConnection(connection);
+    return;
+  }
   const closed = await settledWithin(connection.close(), CLOSE_WAIT_MS);
 
   if (!closed.done) {

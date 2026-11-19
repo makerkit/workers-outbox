@@ -360,6 +360,8 @@ In a `run` schedule, a strict refusal fails the whole occurrence (rolled back, `
 - `{ status: 'dedupe_conflict', reason: 'kind', existingKind }`. The key exists for a different job kind.
 - `{ status: 'invalid_payload', issues }`. The payload failed its schema, or is over `maxPayloadBytes` (default 256 KiB) as JSON: store large data elsewhere (e.g. R2) and enqueue its key.
 
+With a node-postgres pool, `outbox.transaction` owns the checkout from `BEGIN` through release, including with Drizzle’s `withReplicas()` router. A client read timeout or fatal session error discards the checkout, even if the callback catches the error. Transaction decorators retain their isolation settings and callbacks. A custom adapter that exposes only `transaction(fn)` is responsible for releasing its checkout if startup fails before the callback.
+
 Pass `outbox.transaction` the top-level `db`, not a transaction: inside a `tx`, drizzle opens a savepoint, and the nudge would go out before the outer commit.
 
 **Already inside a transaction you don't own?** Call `outbox.enqueue(tx, …)` directly and nudge after commit yourself. If the nudge is forgotten or lost, the job still runs, minutes later, on the cron sweep:
@@ -913,14 +915,14 @@ if (drift.length > 0) {
 
 Not using drizzle-kit? Apply `OUTBOX_MIGRATIONS` from `./sql`, one statement at a time, in order.
 
-**Time limits.** Each invocation has one deadline shared by everything it awaits: claims, handlers, settlements, recovery, cleanup, queue sends and connection acquisition. The queue and scheduled handlers take `invocationBudgetMs` (default 840 s, under Cloudflare's 15-minute limit); the scheduled handler's `recoveryBudgetMs` (default 120 s) caps recovery's share, so a crash backlog can't starve fresh work, and is held back from `schedules`, so slow schedules can't starve recovery. A job whose claim arrives too late to run safely never starts: its attempt closes as `claim_late`, charging neither an attempt nor a crash, and it retries in 5 s.
+**Time limits.** Each invocation has one deadline shared by everything it awaits: claims, handlers, settlements, recovery, cleanup, queue sends and connection acquisition. The queue and scheduled handlers take `invocationBudgetMs` (default 840 s, under Cloudflare's 15-minute limit); the scheduled handler's `recoveryBudgetMs` (default 120 s) caps recovery's share, so a crash backlog can't starve fresh work, and is held back from `schedules`, so slow schedules can't starve recovery. When every lane has a queue, the tick reserves its final 30 s for handoff (at most a quarter of a small invocation). Jobs that no longer fit receive targeted nudges even when the sweep claimed nothing. When a lane relies on cron alone, the sweep can use the remaining invocation. In a mixed registry, cron runs explicit reserved slices first, then nudges due queue-backed jobs before the general sweep. Scheduled cleanup applies retention only to the worker's registered kinds. During a version-gated rollout, recovery observes the same gate as claims. A job whose claim arrives too late to run safely never starts: its attempt closes as `claim_late`, charging neither an attempt nor a crash, and it retries in 5 s.
 
 ## Performance
 
-Each lane runs one job at a time on one Postgres connection: claim, handler, settle, next. A job costs about five database round trips besides the handler (one claim statement, and a settle transaction of four). Throughput is therefore set by connections and handler time:
+Each lane runs one job at a time on one Postgres connection: claim, handler, settle, next. A typical successful job uses about five database round trips for its claim and settlement. Cloudflare Workers also read from the lane after validation and after the handler returns so the timeout includes synchronous work. Those reads count toward `timeoutMs` and bring the estimate to seven round trips on Workers. If the handler catches a client read timeout, the final check can reconnect before settlement applies the handler’s outcome.
 
 ```
-jobs/min ≈ 60 × outbox connections ÷ (handler time + 5 × DB round trip)
+jobs/min ≈ 60 × outbox connections ÷ (handler time + round trips per job × DB round-trip time)
 ```
 
 Outbox connections are `lanes × (sum of the consumers' max_concurrency) + lanes` for cron: 3 with the defaults (`lanes: 1`, `max_concurrency: 2`).
@@ -1079,7 +1081,7 @@ export const outboxFor = (env: Env) =>
 - `createPgConnector(connectionString, { connectionTimeoutMs?, onError? })`: a fresh `pg.Client` per lane, the shape Hyperdrive expects. Connection timeout defaults to 10 s.
 - `createPgPoolConnector(pool, { onError? })`: checks clients out of a pool you own. Set the pool's `connectionTimeoutMillis`, and attach `pool.on('error', …)`: node-pg re-emits a returned client's late errors on the pool, and an unlistened one crashes the process.
 
-Both catch errors a session raises outside a query (such as the FATAL `transaction_timeout` sends) instead of crashing the Worker, report the session as broken so the outbox replaces it, and end a lane idempotently. The pool connector destroys a broken client rather than returning it to the pool.
+Both catch errors a session raises outside a query (such as the FATAL `transaction_timeout` sends) instead of crashing the Worker, report the session as broken so the outbox replaces it, and end a lane idempotently. The pool connector destroys a broken client rather than returning it to the pool. Both connectors discard a session immediately on a client-side `query_timeout`, before application code can catch the error and continue an unfinished transaction; settlement retries on a fresh session within its existing budget.
 
 Writing your own? `connect` returns a `LaneConnection` the outbox owns until it calls exactly one of:
 

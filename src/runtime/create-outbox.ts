@@ -9,6 +9,7 @@ import { LEASE_MARGIN_MS, type AnyJob, type JobDeps } from '../core/define-job';
 import { errorMessage } from '../core/error-message';
 import { createJobRegistry } from '../core/registry';
 import { isUuid } from '../core/uuid';
+import { producerTransaction } from '../pg/producer-transaction';
 import {
   cancelJob,
   deleteTenantJobs,
@@ -254,7 +255,7 @@ export function createOutbox<const J extends readonly AnyJob[]>(
       return unwrap(result, 'operator action');
     }
 
-    await closeConnection(connection);
+    await closeConnection(connection, result.error);
 
     return unwrap(result, 'operator action');
   };
@@ -271,7 +272,7 @@ export function createOutbox<const J extends readonly AnyJob[]>(
     // would only miss. Past the queue's 24 h ceiling no nudge is sent; the cron sweep runs it.
     const pending: PendingNudges = new Map();
 
-    const result = await db.transaction((tx) =>
+    const result = await producerTransaction(db, (tx) =>
       work(tx, async (job, request) => {
         const enqueued = await outbox.enqueue(tx, job, request);
 

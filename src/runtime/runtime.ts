@@ -6,6 +6,7 @@ import type { SqlRunner } from '../drizzle/catalog';
 import type { Emit, OutboxEvent } from './events';
 
 import { DEFAULT_BACKLOG_AGED_MS, evaluateBacklog, type BacklogThresholds } from '../core/backlog';
+import { LEASE_MARGIN_MS } from '../core/define-job';
 import { errorMessage } from '../core/error-message';
 import { HOOK_FAILED_CODE, retry, type SettleOutcome } from '../core/outcome';
 import { decideTransition, type JobBudgetState, type Transition } from '../core/transition';
@@ -262,6 +263,9 @@ export function createRuntime(config: RuntimeConfig) {
   const phaseDeadline = (options: { deadlineAt?: number | undefined }) =>
     options.deadlineAt ?? clock.nowMs() + DEFAULT_PHASE_DEADLINE_MS;
 
+  const registeredKinds = registry.claimable().map((k) => k.kind);
+  const hasCronOnlyLanes = registry.lanes().some((lane) => !queueFor(lane));
+
   const kindFilter = (remainingMs: number, scope: Scope = {}): KindFilter[] => {
     const lane = scope.lane === undefined ? {} : { lane: scope.lane };
     const inScope = (kind: string) => scope.kinds === undefined || scope.kinds.includes(kind);
@@ -344,11 +348,12 @@ export function createRuntime(config: RuntimeConfig) {
     const discard = async () => {
       const stale = connection;
       connection = null;
-      generation++;
+      const mine = ++generation;
 
       if (stale) {
         await destroyConnection(stale);
       }
+      return mine;
     };
 
     const lane: Lane = {
@@ -392,9 +397,9 @@ export function createRuntime(config: RuntimeConfig) {
         }
       },
       replace: async () => {
-        await discard();
-        const mine = generation;
-        // Inside a settlement, whose watchdog bounds this acquisition.
+        const mine = await discard();
+        // A timed-out clock check may still be unwinding while settlement takes the lane.
+        if (retired || generation !== mine) throw new Error('runtime: lane replacement superseded');
         const fresh = await config.connect();
 
         // Retired (or replaced) while this connect was in flight: the late session is not ours.
@@ -414,7 +419,7 @@ export function createRuntime(config: RuntimeConfig) {
         const running = Promise.resolve().then(work);
         const result = await untilDeadline(clock, running, until);
 
-        if (!result.done) {
+        if (!result.done || isConnectionError(result.error)) {
           // Abandoning a query and returning its session to a pool is unsafe: destroy it.
           await lane.retire();
         }
@@ -497,10 +502,15 @@ export function createRuntime(config: RuntimeConfig) {
       return;
     }
 
+    const handlerDb = lane.db;
     const execution = await executeHandler({
       job,
       claimed,
-      db: lane.db,
+      db: handlerDb,
+      replaceDb: async () => {
+        await lane.replace();
+        return lane.db;
+      },
       deps: config.deps,
       clock,
     });
@@ -534,7 +544,11 @@ export function createRuntime(config: RuntimeConfig) {
       { thrown: execution.thrown !== undefined, recovered: false, trigger },
       startSettlement(leaseEndsAtMs, deadlineAt),
       // The runaway's reconnect is part of the settlement, so the watchdog bounds it too.
-      execution.runaway ? () => lane.replace() : undefined,
+      execution.runaway ||
+        !lane.usable ||
+        (lane.db === handlerDb && isConnectionError(execution.thrown))
+        ? () => lane.replace()
+        : undefined,
     );
   }
 
@@ -824,6 +838,20 @@ export function createRuntime(config: RuntimeConfig) {
           continue;
         }
 
+        // No retry left: a connection fault still invalidates the session. In particular a
+        // client read timeout does not prove that Drizzle's ROLLBACK reached PostgreSQL.
+        if (isConnectionError(fault)) {
+          await lane.retire();
+          emitWhileLive(settlement, {
+            type: 'settle_failed',
+            jobId: claimed.id,
+            kind: claimed.kind,
+            attemptNo: claimed.attemptNo,
+            ...dbFault(fault),
+          });
+          return 'settle_failed';
+        }
+
         if (error instanceof CommitError) {
           options.onCommitError?.(fault);
 
@@ -1109,7 +1137,9 @@ export function createRuntime(config: RuntimeConfig) {
               claimByIds(lane.db, {
                 ...gate,
                 ids: [id],
-                kinds: kindFilter(remaining, scope),
+                // The lease starts at claim, after checkout. Its spare settlement margin
+                // can absorb checkout time; runClaimed rechecks the actual deadline.
+                kinds: kindFilter(remaining + (LEASE_MARGIN_MS - MIN_SETTLE_WINDOW_MS), scope),
                 leaseToken: uuidv7(),
                 now: clock.dbNow(),
               }),
@@ -1235,6 +1265,7 @@ export function createRuntime(config: RuntimeConfig) {
     let handed = 0;
 
     for (const laneName of registry.lanes()) {
+      if (!queueFor(laneName)) continue;
       const long = kindFilter(budgetMs, { lane: laneName })
         .filter((k) => !k.fits)
         .map((k) => k.kind);
@@ -1264,14 +1295,14 @@ export function createRuntime(config: RuntimeConfig) {
   // Count-limited *and* time-limited: many slow-but-completing settlements can't eat the invocation.
   async function recover(limit: number, options: { deadlineAt?: number } = {}) {
     const report = emptyReport();
-    const kinds = registry.claimable().map((k) => k.kind);
+    const kinds = registeredKinds;
     const deadlineAt = options.deadlineAt ?? clock.nowMs() + DEFAULT_RECOVERY_BUDGET_MS;
 
     await withLanes(
       1,
       async (lane) => {
         const expired = await lane.bounded(
-          () => listExpiredLeases(lane.db, { limit, now: clock.dbNow(), kinds }),
+          () => listExpiredLeases(lane.db, { ...gate, limit, now: clock.dbNow(), kinds }),
           deadlineAt,
           'recovery listing',
         );
@@ -1335,7 +1366,12 @@ export function createRuntime(config: RuntimeConfig) {
       async (lane) => {
         for (let i = 0; i < retention.maxBatches; i++) {
           const batch = await lane.bounded(
-            () => deleteFinishedJobs(lane.db, { ...retention, now: clock.dbNow() }),
+            () =>
+              deleteFinishedJobs(lane.db, {
+                ...retention,
+                kinds: registeredKinds,
+                now: clock.dbNow(),
+              }),
             deadlineAt,
             'cleanup',
           );
@@ -1439,6 +1475,7 @@ export function createRuntime(config: RuntimeConfig) {
     hasBacklog,
     monitorBacklog,
     continueDrain,
+    hasCronOnlyLanes,
     lanes: () => registry.lanes(),
     nowMs: () => clock.nowMs(),
     sleep: (ms: number) => clock.sleep(ms),

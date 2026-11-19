@@ -1,3 +1,5 @@
+import { sql } from 'drizzle-orm';
+
 import type { AnyJob, JobContext } from '../core/define-job';
 import type { ClaimedJob } from '../store/outbox-store';
 import type { Clock, OutboxDb } from './types';
@@ -18,6 +20,8 @@ export async function executeHandler(input: {
   job: AnyJob;
   claimed: ClaimedJob;
   db: OutboxDb;
+  /** Retire the previous session and lend the attempt a fresh one. */
+  replaceDb?: () => Promise<OutboxDb>;
   deps: unknown;
   clock: Clock;
 }): Promise<ExecutionResult> {
@@ -27,6 +31,9 @@ export async function executeHandler(input: {
   const handlerDb = closable(input.db);
   // The same instant the timer below measures from, on the injected clock.
   const deadline = input.clock.nowMs() + job.timeoutMs;
+  // Timers cannot interrupt synchronous validation or handler work. Check elapsed time at
+  // the boundaries too; an injected/frozen clock must not disable the real attempt timeout.
+  const realDeadline = performance.now() + job.timeoutMs;
   const ctx: JobContext = {
     jobId: claimed.id,
     kind: claimed.kind,
@@ -45,6 +52,11 @@ export async function executeHandler(input: {
   // Validation runs inside the timed attempt: an async validator is part of the lease's work.
   // Set by the timer itself, so a validation that resolves after the timeout can't slip through.
   let expired = false;
+  const hasExpired = () => expired || performance.now() >= realDeadline;
+  // Deployed Workers freeze both JavaScript clocks between I/O events. A timer
+  // microtask alone cannot measure CPU spent validating or running the handler.
+  const workersClock = 'WebSocketPair' in globalThis;
+  const refreshClock = (db: OutboxDb) => db.execute(sql`SELECT clock_timestamp()`);
   // Armed before the attempt starts: a synchronous validator runs before `run`'s first await, and
   // must count against `timeoutMs` (and `ctx.deadline`) like the rest of the attempt.
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -58,12 +70,10 @@ export async function executeHandler(input: {
   const run = (async (): Promise<Settled> => {
     const validated = await validatePayload(job, claimed.payload);
 
-    if (expired) {
+    if (workersClock && !hasExpired()) await refreshClock(input.db);
+    if (hasExpired()) {
       // The attempt was already abandoned: starting the handler now would be a new, unfenced run.
-      return {
-        settled: 'error',
-        error: new Error('validation finished after the attempt timed out'),
-      };
+      return { settled: 'timeout' };
     }
 
     if (!validated.ok) {
@@ -71,20 +81,49 @@ export async function executeHandler(input: {
     }
 
     try {
-      return { settled: 'value', value: await job.handle(validated.value, ctx) };
+      const value = await job.handle(validated.value, ctx);
+      return hasExpired() ? { settled: 'timeout' } : { settled: 'value', value };
     } catch (error) {
-      return { settled: 'error', error };
+      return hasExpired() ? { settled: 'timeout' } : { settled: 'error', error };
     }
-  })();
+  })().then(async (result): Promise<Settled> => {
+    handlerDb.close();
+    if (
+      workersClock &&
+      (result.settled === 'value' || result.settled === 'error') &&
+      !hasExpired()
+    ) {
+      try {
+        await refreshClock(input.db);
+      } catch (error) {
+        // The handler may have caught the error that discarded its connection. Keep
+        // its result while measuring elapsed time on a fresh session, under the same timer.
+        if (!hasExpired()) {
+          if (!input.replaceDb) throw error;
+          const fresh = await input.replaceDb();
+          if (!hasExpired()) await refreshClock(fresh);
+        }
+      }
+    }
+    return result;
+  });
 
-  const first = await Promise.race([run, timeout]);
-  clearTimeout(timer);
-  handlerDb.close();
+  let first: Settled;
+  try {
+    first = await Promise.race([run, timeout]);
+  } finally {
+    clearTimeout(timer);
+    handlerDb.close();
+  }
 
-  if (first.settled === 'timeout') {
+  if (first.settled === 'timeout' || hasExpired()) {
+    expired = true;
     controller.abort(new Error(`job ${claimed.id} timed out after ${job.timeoutMs}ms`));
     const unwound = await Promise.race([
-      run.then(() => true),
+      run.then(
+        () => true,
+        () => true,
+      ),
       input.clock.sleep(job.graceMs).then(() => false),
     ]);
 
@@ -117,6 +156,7 @@ export async function executeHandler(input: {
 }
 
 type Settled =
+  | { settled: 'timeout' }
   | { settled: 'value'; value: unknown }
   | { settled: 'error'; error: unknown }
   | { settled: 'invalid_payload'; message: string };
