@@ -1,6 +1,6 @@
 {
   "name": "@makerkit/workers-outbox",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Transactional outbox for Postgres on Cloudflare Workers (Hyperdrive + Queues + Cron Triggers).",
   "license": "MIT",
   "type": "module",
@@ -63,7 +63,7 @@
   },
   "peerDependencies": {
     "@electric-sql/pglite": ">=0.5.0",
-    "drizzle-orm": ">=1.0.0-rc.4",
+    "drizzle-orm": ">=0.45.0",
     "pg": ">=8.15.0"
   },
   "peerDependenciesMeta": {

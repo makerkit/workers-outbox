@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.0.5 — 2026-11-19
+
+### Fixes
+
+- The package bundles and runs against Drizzle 0.45 again. 0.0.4 imported `PgAsyncDatabase`, a class only Drizzle 1.0 exports, so an app on Drizzle 0.45 failed to build with a missing-export error. `outbox.transaction()` now recognises Drizzle's own transaction method on both lines without importing either class.
+- The `drizzle-orm` peer range is `>=0.45.0`, matching the versions the package works with.
+
 ## 0.0.4 — 2026-11-18
 
 ### Fixes

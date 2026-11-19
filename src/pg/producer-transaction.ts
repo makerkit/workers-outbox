@@ -1,8 +1,8 @@
+import type { PgTransactionConfig } from 'drizzle-orm/pg-core';
 import type { AsyncLocalStorage } from 'node:async_hooks';
 import type { Client, Pool, PoolClient } from 'pg';
 
 import { entityKind } from 'drizzle-orm';
-import { PgAsyncDatabase, type PgTransactionConfig } from 'drizzle-orm/pg-core';
 
 import { guardPgClient, isGuardedPgClient } from './guard-client';
 
@@ -129,12 +129,28 @@ async function delegatedTransaction<Tx, R>(db: Transactional<Tx>, work: Work<Tx,
   }
 }
 
+// Drizzle 1.0 names its base database PgAsyncDatabase, 0.x PgDatabase. Importing either by
+// name fails to bundle against the other line, so find the class by its entity kind.
+const STOCK_DATABASES = new Set(['PgAsyncDatabase', 'PgDatabase']);
+
+/** True when `db.transaction` is Drizzle's own method: not overridden, bound or proxied. */
+export function hasStockTransaction(db: object) {
+  for (let proto = Object.getPrototypeOf(db); proto; proto = Object.getPrototypeOf(proto)) {
+    const owner = proto.constructor as { [entityKind]?: string } | undefined;
+    if (!owner || !Object.hasOwn(owner, entityKind)) continue;
+    if (STOCK_DATABASES.has(owner[entityKind] ?? '')) {
+      return (db as { transaction?: unknown }).transaction === proto.transaction;
+    }
+  }
+  return false;
+}
+
 export function producerTransaction<Tx, R>(db: Transactional<Tx>, work: Work<Tx, R>): Promise<R> {
   const session = pgSession<Tx>(db);
   if (!session) return delegatedTransaction(db, work);
   if (typeof session.client?.query !== 'function' || isGuardedPgClient(session.client))
     return db.transaction(work);
-  return db.transaction === PgAsyncDatabase.prototype.transaction
+  return hasStockTransaction(db)
     ? guardedTransaction(session, work)
     : routedTransaction(db, session, work);
 }
